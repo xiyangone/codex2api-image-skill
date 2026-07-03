@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex2API Image"
+  short_description: "Generate, edit, and batch images through local codex2api with API-key auth."
+  default_prompt: "Use the local codex2api image API with API-key authentication to generate, edit, batch in parallel, verify, or download images."

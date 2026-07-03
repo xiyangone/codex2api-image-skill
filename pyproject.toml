@@ -1,0 +1,23 @@
+[project]
+name = "codex2api-image"
+version = "0.2.0"
+description = "API-key-only CLI for local codex2api image endpoints."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+codex2api-image = "codex2api_image.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.400",
+]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+
+[tool.uv]
+package = true
