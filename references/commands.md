@@ -14,7 +14,9 @@ Global API options are available on API commands:
 - `--env-file` selects a dotenv file.
 - `--timeout` defaults to `900`.
 
-Image commands also support `--clean-background`. It is explicit opt-in only: the default behavior sends the prompt unchanged. Use it for conservative plain-background cleanup, not for transparent output.
+Image commands also support `--clean-background` and `--auto-retry`. Both are explicit opt-in only: the default behavior sends the prompt unchanged. Use `--clean-background` for conservative plain-background cleanup, not for transparent output. Use `--auto-retry` only when failure recovery should try conservative prompt rewrites, JPEG fallback, lower quality, and lower resolution. Policy refusals stay on prompt-frame retries and do not fall through to technical format/quality/size downgrades.
+
+Default to direct API routes. For parallel testing, use `batch --concurrency N` with normal `edit` or `generate` rows; this runs direct API calls concurrently and keeps each row's output path and retry log separate. Use `mode=job` only as a backup for long-running tasks or when direct API is unstable.
 
 ## `models`
 
@@ -54,6 +56,7 @@ uv run codex2api-image edit `
 `gpt-image-2*` uses its own image-input fidelity behavior. Do not pass old input-fidelity fields.
 Use prompt text such as "plain clean background" for requests like "no background"; do not request transparent output.
 Use `--clean-background` only when a more conservative plain-background rewrite is wanted.
+Use `--auto-retry` only when failures should be retried with a recorded fallback sequence.
 
 Explicit clean-background mode:
 
@@ -63,6 +66,19 @@ uv run codex2api-image edit `
   --image G:\in\primary.png `
   --clean-background `
   --out G:\out\clean-bg.png
+```
+
+Explicit auto-retry mode:
+
+```powershell
+uv run codex2api-image edit `
+  --prompt "Change only the shoes; preserve everything else" `
+  --image G:\in\primary.png `
+  --model gpt-image-2-4k `
+  --quality high `
+  --output-format png `
+  --auto-retry `
+  --out G:\out\edit-retry.png
 ```
 
 ## `job`
@@ -79,7 +95,7 @@ Wait and save an existing job:
 uv run codex2api-image job wait 123 --out G:\out\job.png
 ```
 
-Submit, wait, and save:
+Submit, wait, and save. This is a backup route, not the default path:
 
 ```powershell
 uv run codex2api-image job run `
@@ -106,7 +122,7 @@ uv run codex2api-image asset save `
 uv run codex2api-image batch --input G:\batch.json --out-dir G:\out --concurrency 3
 ```
 
-`--concurrency` defaults to `3`. Results are printed in input order. If any row fails, already-started rows finish, then the command reports the failing job index.
+`--concurrency` defaults to `3`. Results are printed in input order. If any row fails, already-started rows finish and successful outputs remain saved; failed rows are returned as JSON entries with `"ok": false`. Direct API parallelism is implemented here; it does not require `/v1/images/jobs`.
 
 Batch JSON:
 
@@ -134,15 +150,16 @@ Batch JSON:
       "input_images": ["G:/in/source.png"],
       "model": "gpt-image-2-4k",
       "upscale": "4k",
+      "auto_retry": true,
       "out": "job.png"
     }
   ]
 }
 ```
 
-If `mode` is omitted, rows with images use `edit`; rows without images use `generate`.
+If `mode` is omitted, rows with images use direct API `edit`; rows without images use direct API `generate`.
 
-Batch rows may set `"clean_background": true` for the explicit conservative prompt wrapper, or `false` to disable a global `--clean-background` flag for that row.
+Batch rows may set `"clean_background": true` for the explicit conservative prompt wrapper, or `false` to disable a global `--clean-background` flag for that row. Batch rows may also set `"auto_retry": true` to enable fallback retries, or `false` to disable a global `--auto-retry` flag for that row.
 
 Batch rows must not include old input-fidelity fields. Output filenames must be unique after joining with `--out-dir`.
 

@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 
 def base_args(**overrides: Any) -> argparse.Namespace:
@@ -23,6 +24,7 @@ def base_args(**overrides: Any) -> argparse.Namespace:
         "upscale": "",
         "timeout": 1,
         "poll_interval": 0.01,
+        "auto_retry": False,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -120,7 +122,7 @@ class CLIBehaviorTests(unittest.TestCase):
         results = run_batch_rows(rows, concurrency=2, runner=runner)
         self.assertEqual([item["prompt"] for item in results], ["slow", "fast"])
 
-    def test_run_batch_rows_reports_job_index_on_failure(self) -> None:
+    def test_run_batch_rows_records_job_index_on_failure(self) -> None:
         from codex2api_image.cli import run_batch_rows
         from codex2api_image.errors import CommandError
 
@@ -129,8 +131,127 @@ class CLIBehaviorTests(unittest.TestCase):
                 raise CommandError("boom")
             return {"index": index}
 
-        with self.assertRaisesRegex(CommandError, "job 2: boom"):
-            run_batch_rows([{"prompt": "a"}, {"prompt": "b"}], concurrency=2, runner=runner)
+        results = run_batch_rows([{"prompt": "a"}, {"prompt": "b"}], concurrency=2, runner=runner)
+
+        self.assertEqual(results[0], {"index": 1})
+        self.assertEqual(results[1]["index"], 2)
+        self.assertFalse(results[1]["ok"])
+        self.assertIn("boom", results[1]["error"])
+
+    def test_batch_row_defaults_to_direct_edit_when_images_exist(self) -> None:
+        from codex2api_image.cli import run_batch_row
+
+        args = base_args(clean_background=False)
+        row = {
+            "prompt": "change outfit",
+            "_resolved_images": ["data:image/png;base64,AAAA"],
+            "out": "out.png",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.save_sync_with_auto_retry") as save_sync, patch(
+            "codex2api_image.cli.run_job_with_auto_retry"
+        ) as run_job:
+            save_sync.return_value = (Path(tmp) / "out.png", [{"reason": "original", "ok": True}])
+            result = run_batch_row(object(), args, 1, row, Path(tmp))  # type: ignore[arg-type]
+
+        self.assertEqual(result["mode"], "edit")
+        save_sync.assert_called_once()
+        run_job.assert_not_called()
+
+    def test_auto_retry_can_be_enabled_per_batch_row(self) -> None:
+        from codex2api_image.cli import auto_retry_enabled
+
+        self.assertTrue(auto_retry_enabled(base_args(), {"auto_retry": True}))
+        self.assertFalse(auto_retry_enabled(base_args(auto_retry=True), {"auto_retry": False}))
+
+    def test_hard_sensitive_refusal_is_detected(self) -> None:
+        from codex2api_image.cli import is_image_output_rejection, is_sensitive_refusal
+
+        error = "HTTP 422 Unprocessable Entity: image_output_rejected: Sorry, I can’t help create a nude version of this scene."
+
+        self.assertTrue(is_image_output_rejection(error))
+        self.assertTrue(is_sensitive_refusal(error))
+
+    def test_sexualized_soft_rejection_can_try_prompt_reframes(self) -> None:
+        from codex2api_image.cli import is_image_output_rejection, is_sensitive_refusal
+
+        error = "HTTP 422 Unprocessable Entity: image_output_rejected: request may sexualize non-sensitive non-explicit visible legs/footwear."
+
+        self.assertTrue(is_image_output_rejection(error))
+        self.assertFalse(is_sensitive_refusal(error))
+
+    def test_policy_rejection_stops_before_technical_fallbacks(self) -> None:
+        from codex2api_image.cli import save_sync_with_auto_retry
+        from codex2api_image.errors import CommandError
+        from codex2api_image.payloads import ImageOptions
+
+        args = base_args(auto_retry=True)
+        calls: list[str] = []
+
+        def reject(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            calls.append(kwargs["options"].output_format)
+            raise CommandError("HTTP 422 Unprocessable Entity: image_output_rejected")
+
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.request_once", reject):
+            with self.assertRaisesRegex(CommandError, "all image attempts failed"):
+                save_sync_with_auto_retry(
+                    client=object(),  # type: ignore[arg-type]
+                    args=args,
+                    row=None,
+                    prompt="upscale this specific image",
+                    options=ImageOptions(model="gpt-image-2", output_format="png"),
+                    mode="edit",
+                    images=("data:image/png;base64,AAAA",),
+                    out=Path(tmp) / "out.png",
+                )
+
+        self.assertEqual(calls, ["png", "png", "png", "png", "png"])
+
+    def test_policy_prompt_reasons_match_retry_plan(self) -> None:
+        from codex2api_image.cli import is_policy_prompt_retry
+        from codex2api_image.payloads import ImageOptions, auto_retry_attempts
+
+        reasons = [reason for reason, _, _ in auto_retry_attempts("enhance", ImageOptions(output_format="png"))]
+        policy_reasons = [reason for reason in reasons if is_policy_prompt_retry(reason)]
+
+        self.assertEqual(
+            policy_reasons,
+            [
+                "original",
+                "sanitized_user_prompt",
+                "t1_conservative_restoration_prompt",
+                "t2_conservative_quality_cleanup_prompt",
+                "t3_modest_outfit_reframe_prompt",
+            ],
+        )
+
+    def test_hard_sensitive_refusal_stops_immediately(self) -> None:
+        from codex2api_image.cli import save_sync_with_auto_retry
+        from codex2api_image.errors import CommandError
+        from codex2api_image.payloads import ImageOptions
+
+        args = base_args(auto_retry=True)
+        calls = 0
+
+        def reject(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            nonlocal calls
+            calls += 1
+            raise CommandError("HTTP 422 Unprocessable Entity: image_output_rejected nude version")
+
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.request_once", reject):
+            with self.assertRaisesRegex(CommandError, "sensitive image refusal"):
+                save_sync_with_auto_retry(
+                    client=object(),  # type: ignore[arg-type]
+                    args=args,
+                    row=None,
+                    prompt="enhance",
+                    options=ImageOptions(model="gpt-image-2", output_format="png"),
+                    mode="edit",
+                    images=("data:image/png;base64,AAAA",),
+                    out=Path(tmp) / "out.png",
+                )
+
+        self.assertEqual(calls, 1)
 
 
 if __name__ == "__main__":

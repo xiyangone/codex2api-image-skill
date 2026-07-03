@@ -38,9 +38,17 @@ uv run codex2api-image models
 - Use `info` on the saved file before reporting any resolution claim.
 - If upstream reports unsupported input-fidelity, remove old CLI/manual fields. Current CLI does not expose that option.
 - If a user says "no background", prompt for a clean plain background rather than transparent output.
+- For repeated `server_error` or missing image output, retry explicitly with `--auto-retry`. The retry log shows which prompt/format/quality/size fallback succeeded or failed.
+- For `422 image_output_rejected`, do not expect JPEG, quality, or size fallbacks to fix the request. The CLI tries prompt-frame fallbacks first and stops on hard sensitive refusals.
+- Treat `sexualized`, `non-sensitive`, `non-explicit`, `legs`, `visible legs`, `feet`, `footwear`, `lower half`, and `body-related` as soft prompt-frame failures unless the error also mentions hard-stop terms. Reframe localized edits as complete modest outfit edits.
+- Treat `nude`, `nudity`, `explicit`, `minor`, `underage`, and `nsfw` as hard-stop terms for automatic retries.
+- Treat `503 account_pool_usage_limit_reached` and `402 deactivated_workspace` as account/workspace availability failures, not prompt failures.
+- If output looks blurrier than the source, compare actual pixel dimensions first. Do not use this skill for local image post-processing.
 
 ## Async jobs
 
-Use `job run` for long tasks. It submits `POST /v1/images/jobs`, polls `GET /v1/images/jobs/:id`, then downloads the signed asset URL from the completed job.
+Use `job run` only as a backup for long tasks or when the user explicitly asks for the image studio/job route. Default parallel testing should use direct API `batch --concurrency N`.
+
+`job run` submits `POST /v1/images/jobs`, polls `GET /v1/images/jobs/:id`, then downloads the signed asset URL from the completed job.
 
 If a job completes without assets, report the raw job JSON status/error.

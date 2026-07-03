@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,7 +16,42 @@ from .http_client import Codex2APIClient
 from .image_info import image_dimensions
 from .images import image_sources_to_urls, save_asset_url, save_response_image
 from .jobs import response_job_id, save_job_assets, submit_job, wait_job
-from .payloads import ImageOptions, clean_background_prompt, edit_payload, generation_payload, job_payload
+from .payloads import ImageOptions, auto_retry_attempts, clean_background_prompt, edit_payload, generation_payload, job_payload
+
+
+POLICY_PROMPT_RETRY_REASONS = {
+    "original",
+    "sanitized_user_prompt",
+    "t1_conservative_restoration_prompt",
+    "t2_conservative_quality_cleanup_prompt",
+    "t3_modest_outfit_reframe_prompt",
+    "t4_closed_foot_tights_reframe_prompt",
+}
+
+SENSITIVE_REFUSAL_RE = re.compile(r"\b(nsfw|nudity|nude|naked|minor|underage)\b|(?<!non-)\bexplicit\b", re.IGNORECASE)
+
+
+def is_image_output_rejection(error: str) -> bool:
+    lower = error.lower()
+    return (
+        "image_output_rejected" in lower
+        or "upstream refused image output" in lower
+        or "sorry, i can't" in lower
+        or "sorry, i can’t" in lower
+        or "response does not contain data[0]" in lower
+    )
+
+
+def is_sensitive_refusal(error: str) -> bool:
+    return bool(SENSITIVE_REFUSAL_RE.search(error))
+
+
+def is_policy_prompt_retry(reason: str) -> bool:
+    return reason in POLICY_PROMPT_RETRY_REASONS
+
+
+def retry_failure_message(prefix: str, last_error: Exception | None, attempt_log: list[dict[str, Any]]) -> str:
+    return f"{prefix}: {last_error}; attempts={json.dumps(attempt_log, ensure_ascii=False)}"
 
 
 def build_options(args: argparse.Namespace, row: dict[str, Any] | None = None) -> ImageOptions:
@@ -64,6 +100,13 @@ def prompt_for_request(prompt: str, args: argparse.Namespace, row: dict[str, Any
     return clean_background_prompt(prompt)
 
 
+def auto_retry_enabled(args: argparse.Namespace, row: dict[str, Any] | None = None) -> bool:
+    enabled = bool(getattr(args, "auto_retry", False))
+    if row is not None:
+        enabled = row_bool(row, "auto_retry", enabled)
+    return enabled
+
+
 def client_from_args(args: argparse.Namespace) -> Codex2APIClient:
     env_file = Path(args.env_file).expanduser() if args.env_file else None
     cfg = load_config(env_file=env_file, base_url=args.base_url, api_key=args.api_key)
@@ -89,30 +132,48 @@ def cmd_models(args: argparse.Namespace) -> None:
 def cmd_generate(args: argparse.Namespace) -> None:
     client = client_from_args(args)
     options = build_options(args)
-    payload = generation_payload(prompt_for_request(args.prompt, args), options)
+    prompt = prompt_for_request(args.prompt, args)
+    payload = generation_payload(prompt, options)
     if args.dry_run:
         print_json(payload)
         return
-    response = client.request_json("POST", "/images/generations", payload, timeout=args.timeout)
-    saved = save_response_image(client, response, Path(args.out), args.timeout)
+    saved, attempts = save_sync_with_auto_retry(
+        client=client,
+        args=args,
+        row=None,
+        prompt=prompt,
+        options=options,
+        mode="generate",
+        images=(),
+        out=Path(args.out),
+    )
     kind, width, height = image_dimensions(saved)
-    print_json({"saved": str(saved), "kind": kind, "width": width, "height": height, "mode": "sync-generate"})
+    print_json({"saved": str(saved), "kind": kind, "width": width, "height": height, "mode": "sync-generate", "attempts": attempts})
 
 
 def cmd_edit(args: argparse.Namespace) -> None:
     client = client_from_args(args)
     options = build_options(args)
     images = image_sources_to_urls(tuple(args.image))
-    payload = edit_payload(prompt_for_request(args.prompt, args), images, options)
+    prompt = prompt_for_request(args.prompt, args)
+    payload = edit_payload(prompt, images, options)
     if args.dry_run:
         redacted = dict(payload)
         redacted["images"] = [{"image_url": f"<image {idx}>"} for idx, _ in enumerate(images, start=1)]
         print_json(redacted)
         return
-    response = client.request_json("POST", "/images/edits", payload, timeout=args.timeout)
-    saved = save_response_image(client, response, Path(args.out), args.timeout)
+    saved, attempts = save_sync_with_auto_retry(
+        client=client,
+        args=args,
+        row=None,
+        prompt=prompt,
+        options=options,
+        mode="edit",
+        images=images,
+        out=Path(args.out),
+    )
     kind, width, height = image_dimensions(saved)
-    print_json({"saved": str(saved), "kind": kind, "width": width, "height": height, "mode": "sync-edit"})
+    print_json({"saved": str(saved), "kind": kind, "width": width, "height": height, "mode": "sync-edit", "attempts": attempts})
 
 
 def cmd_job_submit(args: argparse.Namespace) -> None:
@@ -139,18 +200,19 @@ def cmd_job_wait(args: argparse.Namespace) -> None:
 def cmd_job_run(args: argparse.Namespace) -> None:
     client = client_from_args(args)
     images = image_sources_to_urls(tuple(args.image or ()))
-    payload = job_payload(prompt_for_request(args.prompt, args), images, build_options(args))
+    options = build_options(args)
+    prompt = prompt_for_request(args.prompt, args)
+    payload = job_payload(prompt, images, options)
     if args.dry_run:
         redacted = dict(payload)
         if "input_images" in redacted:
             redacted["input_images"] = [f"<image {idx}>" for idx, _ in enumerate(images, start=1)]
         print_json(redacted)
         return
-    response = submit_job(client, payload, args.timeout)
-    job_id = response_job_id(response)
-    job = wait_job(client, job_id, args.timeout, args.poll_interval)
+    job, attempts = run_job_with_auto_retry(client, args, None, prompt, images, options)
+    job_id = int(job.get("id") or 0)
     saved = save_job_assets(client, job, Path(args.out) if args.out else None, Path(args.out_dir) if args.out_dir else None, args.timeout)
-    print_json({"job_id": job_id, "saved": [str(path) for path in saved]})
+    print_json({"job_id": job_id, "saved": [str(path) for path in saved], "attempts": attempts})
 
 
 def cmd_asset_save(args: argparse.Namespace) -> None:
@@ -184,30 +246,199 @@ def ensure_unique_batch_outputs(rows: list[dict[str, Any]], out_dir: Path) -> No
         seen[key] = index
 
 
+def resolve_batch_images(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    resolved: list[dict[str, Any]] = []
+    for row in rows:
+        copy = dict(row)
+        copy["_resolved_images"] = list(image_sources_to_urls(row_images(row)))
+        resolved.append(copy)
+    return resolved
+
+
+def resolved_row_images(row: dict[str, Any]) -> tuple[str, ...]:
+    raw = row.get("_resolved_images")
+    if isinstance(raw, list):
+        return tuple(str(item) for item in raw)
+    return image_sources_to_urls(row_images(row))
+
+
+def request_once(
+    client: Codex2APIClient,
+    *,
+    mode: str,
+    prompt: str,
+    images: tuple[str, ...],
+    options: ImageOptions,
+    timeout: int,
+) -> dict[str, Any]:
+    if mode == "edit":
+        return client.request_json("POST", "/images/edits", edit_payload(prompt, images, options), timeout=timeout)
+    if mode == "generate":
+        return client.request_json("POST", "/images/generations", generation_payload(prompt, options), timeout=timeout)
+    raise CommandError(f"unknown mode: {mode}")
+
+
+def request_with_auto_retry(
+    *,
+    client: Codex2APIClient,
+    args: argparse.Namespace,
+    row: dict[str, Any] | None,
+    prompt: str,
+    options: ImageOptions,
+    mode: str,
+    images: tuple[str, ...],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    plan = auto_retry_attempts(prompt, options) if auto_retry_enabled(args, row) else [("original", options, prompt)]
+    attempt_log: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    policy_rejection_seen = False
+    for index, (reason, attempt_options, attempt_prompt) in enumerate(plan, start=1):
+        if policy_rejection_seen and not is_policy_prompt_retry(reason):
+            break
+        entry: dict[str, Any] = {
+            "index": index,
+            "reason": reason,
+            "model": attempt_options.model,
+            "size": attempt_options.size,
+            "quality": attempt_options.quality,
+            "output_format": attempt_options.output_format,
+            "background": attempt_options.background,
+        }
+        try:
+            response = request_once(client, mode=mode, prompt=attempt_prompt, images=images, options=attempt_options, timeout=args.timeout)
+            entry["ok"] = True
+            attempt_log.append(entry)
+            return response, attempt_log
+        except CommandError as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)
+            if is_image_output_rejection(str(exc)):
+                policy_rejection_seen = True
+                entry["rejected"] = True
+                if is_sensitive_refusal(str(exc)):
+                    entry["stop"] = "sensitive_refusal"
+                    attempt_log.append(entry)
+                    raise CommandError(retry_failure_message("sensitive image refusal; stopping retries", exc, attempt_log)) from exc
+            attempt_log.append(entry)
+            last_error = exc
+    raise CommandError(retry_failure_message("all image attempts failed", last_error, attempt_log))
+
+
+def save_sync_with_auto_retry(
+    *,
+    client: Codex2APIClient,
+    args: argparse.Namespace,
+    row: dict[str, Any] | None,
+    prompt: str,
+    options: ImageOptions,
+    mode: str,
+    images: tuple[str, ...],
+    out: Path,
+) -> tuple[Path, list[dict[str, Any]]]:
+    plan = auto_retry_attempts(prompt, options) if auto_retry_enabled(args, row) else [("original", options, prompt)]
+    attempt_log: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    policy_rejection_seen = False
+    for index, (reason, attempt_options, attempt_prompt) in enumerate(plan, start=1):
+        if policy_rejection_seen and not is_policy_prompt_retry(reason):
+            break
+        entry: dict[str, Any] = {
+            "index": index,
+            "reason": reason,
+            "model": attempt_options.model,
+            "size": attempt_options.size,
+            "quality": attempt_options.quality,
+            "output_format": attempt_options.output_format,
+            "background": attempt_options.background,
+        }
+        try:
+            response = request_once(client, mode=mode, prompt=attempt_prompt, images=images, options=attempt_options, timeout=args.timeout)
+            saved = save_response_image(client, response, out, args.timeout)
+            entry["ok"] = True
+            attempt_log.append(entry)
+            return saved, attempt_log
+        except CommandError as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)
+            if is_image_output_rejection(str(exc)):
+                policy_rejection_seen = True
+                entry["rejected"] = True
+                if is_sensitive_refusal(str(exc)):
+                    entry["stop"] = "sensitive_refusal"
+                    attempt_log.append(entry)
+                    raise CommandError(retry_failure_message("sensitive image refusal; stopping retries", exc, attempt_log)) from exc
+            attempt_log.append(entry)
+            last_error = exc
+    raise CommandError(retry_failure_message("all image attempts failed", last_error, attempt_log))
+
+
+def run_job_with_auto_retry(
+    client: Codex2APIClient,
+    args: argparse.Namespace,
+    row: dict[str, Any] | None,
+    prompt: str,
+    images: tuple[str, ...],
+    options: ImageOptions,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    plan = auto_retry_attempts(prompt, options) if auto_retry_enabled(args, row) else [("original", options, prompt)]
+    attempt_log: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    policy_rejection_seen = False
+    for index, (reason, attempt_options, attempt_prompt) in enumerate(plan, start=1):
+        if policy_rejection_seen and not is_policy_prompt_retry(reason):
+            break
+        entry: dict[str, Any] = {
+            "index": index,
+            "reason": reason,
+            "model": attempt_options.model,
+            "size": attempt_options.size,
+            "quality": attempt_options.quality,
+            "output_format": attempt_options.output_format,
+            "background": attempt_options.background,
+            "upscale": attempt_options.upscale,
+        }
+        try:
+            response = submit_job(client, job_payload(attempt_prompt, images, attempt_options), args.timeout)
+            job_id = response_job_id(response)
+            entry["job_id"] = job_id
+            job = wait_job(client, job_id, args.timeout, args.poll_interval)
+            entry["ok"] = True
+            attempt_log.append(entry)
+            return job, attempt_log
+        except CommandError as exc:
+            entry["ok"] = False
+            entry["error"] = str(exc)
+            if is_image_output_rejection(str(exc)):
+                policy_rejection_seen = True
+                entry["rejected"] = True
+                if is_sensitive_refusal(str(exc)):
+                    entry["stop"] = "sensitive_refusal"
+                    attempt_log.append(entry)
+                    raise CommandError(retry_failure_message("sensitive image refusal; stopping retries", exc, attempt_log)) from exc
+            attempt_log.append(entry)
+            last_error = exc
+    raise CommandError(retry_failure_message("all image job attempts failed", last_error, attempt_log))
+
+
 def run_batch_row(client: Codex2APIClient, args: argparse.Namespace, index: int, row: dict[str, Any], out_dir: Path) -> dict[str, Any]:
     prompt = str(row.get("prompt") or "").strip()
     if not prompt:
         raise CommandError("missing prompt")
     options = build_options(args, row)
     prompt = prompt_for_request(prompt, args, row)
-    images = image_sources_to_urls(row_images(row))
+    images = resolved_row_images(row)
     mode = str(row.get("mode") or ("edit" if images else "generate")).lower()
     out = batch_output_path(row, out_dir, index)
     if mode in {"job", "async"}:
-        response = submit_job(client, job_payload(prompt, images, options), args.timeout)
-        job_id = response_job_id(response)
-        job = wait_job(client, job_id, args.timeout, args.poll_interval)
+        job, attempts = run_job_with_auto_retry(client, args, row, prompt, images, options)
+        job_id = int(job.get("id") or 0)
         assets = job.get("assets")
         saved = save_job_assets(client, job, out if isinstance(assets, list) and len(assets) == 1 else None, out_dir, args.timeout)
-        return {"index": index, "mode": "job", "job_id": job_id, "saved": [str(path) for path in saved]}
-    if mode == "edit":
-        response = client.request_json("POST", "/images/edits", edit_payload(prompt, images, options), timeout=args.timeout)
-    elif mode == "generate":
-        response = client.request_json("POST", "/images/generations", generation_payload(prompt, options), timeout=args.timeout)
-    else:
+        return {"index": index, "ok": True, "mode": "job", "job_id": job_id, "saved": [str(path) for path in saved], "attempts": attempts}
+    if mode not in {"edit", "generate"}:
         raise CommandError(f"unknown mode: {mode}")
-    saved = save_response_image(client, response, out, args.timeout)
-    return {"index": index, "mode": mode, "saved": str(saved)}
+    saved, attempts = save_sync_with_auto_retry(client=client, args=args, row=row, prompt=prompt, options=options, mode=mode, images=images, out=out)
+    return {"index": index, "ok": True, "mode": mode, "saved": str(saved), "attempts": attempts}
 
 
 def run_batch_rows(
@@ -219,13 +450,12 @@ def run_batch_rows(
     if concurrency < 1:
         raise CommandError("batch concurrency must be at least 1")
     ordered: list[dict[str, Any] | None] = [None] * len(rows)
-    first_error: str | None = None
     if concurrency == 1:
         for index, row in enumerate(rows, start=1):
             try:
                 ordered[index - 1] = runner(index, row)
             except Exception as exc:
-                raise CommandError(f"batch failed: job {index}: {exc}") from exc
+                ordered[index - 1] = {"index": index, "ok": False, "error": str(exc)}
         return [item for item in ordered if item is not None]
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -235,16 +465,14 @@ def run_batch_rows(
             try:
                 ordered[index - 1] = future.result()
             except Exception as exc:
-                if first_error is None:
-                    first_error = f"job {index}: {exc}"
-    if first_error is not None:
-        raise CommandError(f"batch failed: {first_error}")
+                ordered[index - 1] = {"index": index, "ok": False, "error": str(exc)}
     return [item for item in ordered if item is not None]
 
 
 def cmd_batch(args: argparse.Namespace) -> None:
     client = client_from_args(args)
     rows = read_jobs(Path(args.input))
+    rows = resolve_batch_images(rows)
     out_dir = Path(args.out_dir)
     ensure_unique_batch_outputs(rows, out_dir)
     results = run_batch_rows(
@@ -252,7 +480,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
         concurrency=args.concurrency,
         runner=lambda index, row: run_batch_row(client, args, index, row, out_dir),
     )
-    print_json({"results": results})
+    print_json({"results": results, "failed": sum(1 for item in results if not item.get("ok", True))})
 
 
 def cmd_info(args: argparse.Namespace) -> None:
@@ -284,6 +512,7 @@ def add_image_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--style", default="")
     parser.add_argument("--upscale", choices=("", "2k", "4k"), default="")
     parser.add_argument("--clean-background", action="store_true")
+    parser.add_argument("--auto-retry", action="store_true")
 
 
 def build_parser() -> argparse.ArgumentParser:
