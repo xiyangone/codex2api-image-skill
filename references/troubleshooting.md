@@ -1,54 +1,54 @@
-# Troubleshooting
+# 故障处理与验证边界
 
-## Always surface raw failures first
+## 四层证据分开记录
 
-Report:
+1. `/health` 成功：传输和健康入口可达。
+2. `models` 成功：当前 API Key 能读取目录。
+3. 图片请求被接受 / job 可查询：该次业务请求状态可读。
+4. 图片已下载并完整解码：文件存在且尺寸、格式可确认；内容质量仍需目视验收。
 
-- HTTP status and response body.
-- Timeout or connection error.
-- Auth failure such as `missing_api_key`.
-- `no_available_account`.
-- Safety or prompt-filter response.
-- Saved path and actual dimensions if an image was produced.
+没有账号时，不自动执行生图、登录、发码或账号探测。可完成 dry-run、单元测试、类型检查和模拟接口验证，但不能声明端到端生图通过。
 
-## Authentication
+## 认证配置
 
-This skill uses API Key mode only:
+只读取专用配置：显式命令参数 → CODEX2API_* 进程变量 → 指定文件或 skill 的 .env。默认服务地址为 http://127.0.0.1:8080/v1。不使用 OPENAI_* 后备值；这避免将本地密钥发往其他工具遗留的服务地址。
 
-1. Process env `CODEX2API_API_KEY`.
-2. Process env `OPENAI_API_KEY`.
-3. Skill-local `.env` `CODEX2API_API_KEY`.
-4. Skill-local `.env` `OPENAI_API_KEY`.
+明确指定的 env 文件不存在、密钥缺失或为空时直接报错。配置对象、错误体与日志不得泄露密钥。不要把 API Key 直接放进 shell 命令历史。
 
-If `.env` exists but the key is blank, stop and say it is blank.
+## 分类处理
 
-## Service checks
+| 现象 | 处理 |
+|---|---|
+| 401/403 | 检查专用 API Key 和权限，不重试提示词 |
+| 429/503 + Retry-After | 用户启用 auto-retry 后有限退避；等待超过剩余预算时停止并报告 |
+| 503 但没有可用退避信息、无账号、额度已耗尽 | 报告服务 / 账号池状态，不盲目连续生成 |
+| 明确内容拒绝、image_output_rejected、policy_* | 保留脱敏证据并停止，不换话术或降档尝试 |
+| POST 连接 / 读取超时，未拿到可靠结果 | outcome_unknown；不能判断是否已经受理，不自动重发 |
+| job 等待超时 | 报告 job_id，用同一 Key 执行 job wait，不新建任务 |
+| job 成功但 warning 非空或图片数不足 | 保留已保存文件，报告部分成功，退出码非零 |
+| job 物理尺寸不符 | 保留原图，报告期望与实际尺寸，不本地缩放 |
+| 输出已存在、路径越界或文件无效 | 拒绝写入；修正位置后下载已有任务，不重生成 |
+| 图片 URL 重定向 | 客户端不会携带凭据追随重定向；先核对资源地址和服务反代配置 |
+
+v2.9.5 新增账号瞬时限流短冻结和有界调度等待队列；这些是基础设施状态，不是提示词问题。文本驱动模型选择和回退属于服务端设置，不要误改 CLI 的图像模型或后台全局配置。
+
+## 错误报告
+
+单命令失败在 stderr 输出 JSON；包含可用的 route、status_code、error_kind、body、retry_after、job_id、outcome_unknown 和 attempts。响应体会脱敏，超大错误体可能截断。批量结果按输入顺序输出，failed 大于零时退出码为 1。
+
+保存失败不触发第二次生成。部分落盘时报告 saved 或 partial_path；不要把残缺文件作为成功产物。
+
+## 文件验证
+
+info 和保存流程使用 Pillow 校验结构后重新打开并完整解码，拒绝截断图片；支持 PNG、JPEG、WebP、GIF。单个下载 / 校验文件上限 64 MiB，动画最多 256 帧，并启用解压炸弹告警拦截。
+
+实际格式不符时调整文件扩展名而不重新编码，最终路径以 saved 为准。文件存在检查之外，还使用排他创建防止并发覆盖。输出不得经过符号链接或目录连接，也不能逃出指定目录。
+
+## 维护验证
 
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8080/health
-uv run codex2api-image models
+uv run --locked python -B -m unittest discover -s tests -v
+uv run --locked pyright
 ```
 
-`GET /health` proves the exe is alive. `models` proves API-key auth works.
-
-## Size and upscale
-
-- `gpt-image-2-2k` and `gpt-image-2-4k` are model IDs exposed by this local service when available.
-- `upscale=2k|4k` on async jobs is post-save resizing.
-- Use `info` on the saved file before reporting any resolution claim.
-- If upstream reports unsupported input-fidelity, remove old CLI/manual fields. Current CLI does not expose that option.
-- If a user says "no background", prompt for a clean plain background rather than transparent output.
-- For repeated `server_error` or missing image output, retry explicitly with `--auto-retry`. The retry log shows which prompt/format/quality/size fallback succeeded or failed.
-- For `422 image_output_rejected`, do not expect JPEG, quality, or size fallbacks to fix the request. The CLI tries prompt-frame fallbacks first and stops on hard sensitive refusals.
-- Treat `sexualized`, `non-sensitive`, `non-explicit`, `legs`, `visible legs`, `feet`, `footwear`, `lower half`, and `body-related` as soft prompt-frame failures unless the error also mentions hard-stop terms. Reframe localized edits as complete modest outfit edits.
-- Treat `nude`, `nudity`, `explicit`, `minor`, `underage`, and `nsfw` as hard-stop terms for automatic retries.
-- Treat `503 account_pool_usage_limit_reached` and `402 deactivated_workspace` as account/workspace availability failures, not prompt failures.
-- If output looks blurrier than the source, compare actual pixel dimensions first. Do not use this skill for local image post-processing.
-
-## Async jobs
-
-Use `job run` only as a backup for long tasks or when the user explicitly asks for the image studio/job route. Default parallel testing should use direct API `batch --concurrency N`.
-
-`job run` submits `POST /v1/images/jobs`, polls `GET /v1/images/jobs/:id`, then downloads the signed asset URL from the completed job.
-
-If a job completes without assets, report the raw job JSON status/error.
+离线测试使用合成图片、临时目录和模拟 HTTP；不需要账号或真实图片请求。测试通过不替代真实出图及视觉验收。

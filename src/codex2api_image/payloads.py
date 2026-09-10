@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from dataclasses import dataclass
 import re
+from dataclasses import dataclass
 from typing import Any
 
-OMIT_VALUES = {"", "omit", "none", "null", "unspecified"}
+from .errors import CommandError
+
+MAX_IMAGE_INPUTS = 16
+MAX_IMAGE_PIXELS = 8_294_400
+SIZE_RE = re.compile(r"^(\d+)x(\d+)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -16,232 +19,144 @@ class ImageOptions:
     output_format: str = "png"
     response_format: str = "b64_json"
     background: str = "auto"
-    moderation: str = "low"
+    moderation: str = ""
     output_compression: int | None = None
     n: int = 1
     style: str = ""
     upscale: str = ""
+    strict_size: bool | None = None
+    upscale_fit: str = ""
 
 
-def maybe_set(payload: dict[str, Any], key: str, value: str | int | None, *, omit_auto: bool = False) -> None:
-    if value is None:
-        return
-    if isinstance(value, str):
-        normalized = value.strip()
-        if normalized.lower() in OMIT_VALUES:
-            return
-        if omit_auto and normalized.lower() == "auto":
-            return
-        payload[key] = normalized
-        return
-    payload[key] = value
+def parse_size(size: str) -> tuple[int, int] | None:
+    if size == "auto":
+        return None
+    match = SIZE_RE.fullmatch(size)
+    if match is None or min(int(match[1]), int(match[2])) < 1:
+        raise CommandError("size must be auto or positive WIDTHxHEIGHT")
+    return int(match[1]), int(match[2])
 
 
-def styled_prompt(prompt: str, style: str) -> str:
-    prompt = prompt.strip()
-    style = style.strip()
-    if not style:
-        return prompt
-    return f"{prompt}\n\nStyle: {style}"
+def validate_options(options: ImageOptions, mode: str) -> None:
+    if not options.model.strip() or any(char.isspace() for char in options.model):
+        raise CommandError("model must be a non-empty model ID without whitespace")
+    allowed_quality = {"auto", "low", "medium", "high", "xhigh", "max"}
+    if options.quality not in allowed_quality:
+        raise CommandError("unsupported quality value")
+    if options.model.lower().startswith("gpt-image-2") and not options.model.lower().startswith("gpt-image-2.5") and options.quality in {"xhigh", "max"}:
+        raise CommandError("xhigh/max require GPT Image 2.5; quality will not be silently downgraded")
+    if options.output_format not in {"png", "jpeg", "webp"}:
+        raise CommandError("output_format must be png, jpeg or webp")
+    if options.response_format not in {"b64_json", "url"}:
+        raise CommandError("response_format must be b64_json or url")
+    if options.background not in {"auto", "opaque"}:
+        raise CommandError("background must be auto or opaque; transparent output is not requested by this skill")
+    if options.moderation not in {"", "auto", "low"}:
+        raise CommandError("moderation must be auto or low when supplied")
+    if type(options.n) is not int or not 1 <= options.n <= 4:
+        raise CommandError("n must be an integer between 1 and 4")
+    if options.output_compression is not None and (type(options.output_compression) is not int or not 0 <= options.output_compression <= 100):
+        raise CommandError("output_compression must be an integer between 0 and 100")
+    if options.output_compression is not None and options.output_format == "png":
+        raise CommandError("output_compression applies only to jpeg/webp")
+    if options.strict_size is not None and type(options.strict_size) is not bool:
+        raise CommandError("strict_size must be a boolean")
+    if options.upscale not in {"", "2k", "4k"} or options.upscale_fit not in {"", "pad", "cover"}:
+        raise CommandError("invalid upscale or upscale_fit value")
+    size = parse_size(options.size)
+    if mode == "job":
+        if options.response_format != "b64_json" or options.moderation or options.output_compression is not None:
+            raise CommandError("job does not accept response_format=url, moderation or output_compression")
+        if size and options.strict_size is not False:
+            size = tuple(((value + 15) // 16) * 16 for value in size)
+    else:
+        if options.n != 1:
+            raise CommandError("synchronous n>1 is not supported by codex2api; use batch or job")
+        if options.upscale or options.strict_size is not None or options.upscale_fit:
+            raise CommandError("upscale/strict_size/upscale_fit are job-only; use a model tier for synchronous upscale")
+    if size and options.model.lower().startswith("gpt-image-2"):
+        width, height = size
+        if width % 16 or height % 16:
+            raise CommandError("synchronous image size must be a multiple of 16; use job for an exact display canvas")
+        if width * height > MAX_IMAGE_PIXELS or max(width, height) > 3 * min(width, height):
+            raise CommandError("upstream size exceeds 8294400 pixels or a 3:1 aspect ratio")
 
 
 def clean_background_prompt(prompt: str) -> str:
-    prompt = prompt.strip()
-    return "\n".join(
-        [
-            "Objective: use a plain clean light background with no clutter.",
-            "For image edits, change only the background.",
-            "Preserve the primary subject, pose, clothing, crop, lighting, and facial/body details.",
-            "Use a plain clean light background; not transparent.",
-            "Do not add text, watermark, extra people, props, or scenery.",
-            f"User request: {prompt}",
-        ]
-    )
+    return "\n".join([
+        "Objective: use a plain clean light background with no clutter.",
+        "For image edits, change only the background.",
+        "Preserve the primary subject, pose, clothing, crop, lighting, and facial/body details.",
+        "Use a plain clean light background; not transparent.",
+        "Do not add text, watermark, extra people, props, or scenery.",
+        f"User request: {prompt}",
+    ])
 
 
-def sanitized_user_request(prompt: str) -> str:
-    sanitized = prompt.strip()
-    replacements = (
-        (r"\bupscale\s+this\s+(specific|particular)\s+image\b", "make a conservative clarity pass"),
-        (r"\b(edit|enhance|restore|process)\s+this\s+(specific|particular)\s+image\b", "apply a conservative visual pass"),
-        (r"\bthis\s+(specific|particular)\s+image\b", "the provided reference"),
-        (r"\bpreserv(e|ing)\s+(the\s+)?(original\s+)?identity\b", "keep visual continuity"),
-        (r"\bidentity\b", "visual continuity"),
-        (r"\bperson\b", "main subject"),
-        (r"\bface\b", "visible details"),
-        (r"\bbody\s+shape\b", "silhouette"),
-        (r"\b4k\b", "clean output"),
-        (r"\bhigh[-\s]?resolution\b", "clean output"),
-        (r"\bupscale\b", "clarity pass"),
-        (r"\bversion\b", "result"),
-    )
-    for pattern, replacement in replacements:
-        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE)
-    sanitized = re.sub(r"\bwhile\s+keep\b", "while keeping", sanitized, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", sanitized).strip(" .")
+def validate_prompt(prompt: str, mode: str) -> None:
+    if not prompt.strip():
+        raise CommandError("prompt is required")
+    if mode == "job" and len(prompt) > 8000:
+        raise CommandError("job prompt must be at most 8000 characters")
 
 
-def sanitized_retry_prompt(prompt: str) -> str:
-    sanitized = sanitized_user_request(prompt)
-    if sanitized:
-        return " ".join(
-            [
-                "Using the provided reference, apply a conservative non-destructive visual cleanup.",
-                "Keep the scene, pose, clothing, background, lighting, and composition unchanged.",
-                "Do not redraw, restyle, or change semantic content.",
-                f"Sanitized user request: {sanitized}.",
-            ]
-        )
-    return " ".join(
-        [
-            "Using the provided reference, apply a conservative non-destructive visual cleanup.",
-            "Keep the scene, pose, clothing, background, lighting, and composition unchanged.",
-            "Do not redraw, restyle, or change semantic content.",
-        ]
-    )
-
-
-def restoration_retry_prompt(prompt: str) -> str:
-    return " ".join(
-        [
-            "Perform a conservative photo restoration pass on the provided reference.",
-            "Keep the scene, composition, pose, clothing, background, and lighting direction unchanged.",
-            "Apply only non-destructive cleanup: reduce visible compression artifacts and keep natural exposure.",
-        ]
-    )
-
-
-def quality_cleanup_retry_prompt(prompt: str) -> str:
-    return " ".join(
-        [
-            "Apply a conservative quality cleanup to the provided reference.",
-            "Keep the same scene, composition, pose, clothing, background, and lighting.",
-            "Make no semantic content changes; do not redraw or restyle the scene.",
-            "Keep natural color and exposure while reducing visible artifacts only.",
-        ]
-    )
-
-
-def modest_outfit_reframe_prompt(prompt: str) -> str:
-    return " ".join(
-        [
-            "Using the provided reference, make a complete modest casual outfit edit rather than a localized body-area edit.",
-            "Keep the same setting, composition, pose, natural daylight, and camera angle.",
-            "Use everyday clothing language and keep unrelated scene details unchanged.",
-            f"User request: {sanitized_user_request(prompt)}",
-        ]
-    )
-
-
-def prompt_mentions_white_tights(prompt: str) -> bool:
-    return bool(
-        re.search(
-            r"(白丝|白色丝袜|白色连裤袜|white\s+(opaque\s+)?(tights|stockings)|opaque\s+white\s+tights)",
-            prompt,
-            flags=re.IGNORECASE,
-        )
-    )
-
-
-def prompt_mentions_no_shoes_tights(prompt: str) -> bool:
-    return prompt_mentions_white_tights(prompt) and bool(
-        re.search(r"(裸足|赤脚|无鞋|不穿鞋|no\s+shoes|without\s+shoes|barefoot)", prompt, flags=re.IGNORECASE)
-    )
-
-
-def closed_foot_tights_reframe_prompt(prompt: str) -> str:
-    phone_wallpaper = bool(re.search(r"(手机壁纸|phone\s+wallpaper|portrait)", prompt, flags=re.IGNORECASE))
-    prefix = "Create a portrait-oriented phone wallpaper from the reference." if phone_wallpaper else "Using the provided reference, edit the outfit."
-    return " ".join(
-        [
-            prefix,
-            "Change the clothing to a modest casual outfit: a relaxed white top, denim shorts, smooth closed-foot opaque white tights, and no shoes.",
-            "The tights should look like one continuous soft fabric layer with closed rounded ends, not toe-sock styling.",
-            "Keep the grassy outdoor setting, seated composition, natural daylight, and camera angle.",
-        ]
-    )
-
-
-def auto_retry_attempts(prompt: str, options: ImageOptions) -> list[tuple[str, ImageOptions, str]]:
-    attempts: list[tuple[str, ImageOptions, str]] = [("original", options, prompt)]
-
-    retry_prompts = [
-        ("sanitized_user_prompt", sanitized_retry_prompt(prompt)),
-        ("t1_conservative_restoration_prompt", restoration_retry_prompt(prompt)),
-        ("t2_conservative_quality_cleanup_prompt", quality_cleanup_retry_prompt(prompt)),
-        ("t3_modest_outfit_reframe_prompt", modest_outfit_reframe_prompt(prompt)),
-    ]
-    if prompt_mentions_no_shoes_tights(prompt):
-        retry_prompts.append(("t4_closed_foot_tights_reframe_prompt", closed_foot_tights_reframe_prompt(prompt)))
-    for reason, attempt_prompt in retry_prompts:
-        attempts.append((reason, options, attempt_prompt))
-
-    png_like = options.output_format.strip().lower() in {"", "png", ".png"}
-    jpeg_options = replace(options, output_format="jpeg", background="opaque" if options.background.strip().lower() == "transparent" else options.background)
-    if png_like:
-        attempts.append(("png_to_jpeg", jpeg_options, restoration_retry_prompt(prompt)))
-
-    quality_seen = {options.quality.strip().lower()}
-    for quality in ("auto", "low"):
-        if quality not in quality_seen:
-            attempts.append((f"quality_{quality}", replace(jpeg_options if png_like else options, quality=quality), restoration_retry_prompt(prompt)))
-            quality_seen.add(quality)
-
-    normal_model = "gpt-image-2" if options.model.strip().lower() in {"gpt-image-2-2k", "gpt-image-2-4k"} else options.model
-    lowered = replace(
-        jpeg_options if png_like else options,
-        model=normal_model,
-        size="auto",
-        quality="auto",
-        upscale="",
-    )
-    attempts.append(("lower_resolution_default", lowered, restoration_retry_prompt(prompt)))
-
-    deduped: list[tuple[str, ImageOptions, str]] = []
-    seen: set[tuple[str, ImageOptions, str]] = set()
-    for reason, attempt_options, attempt_prompt in attempts:
-        key = (reason, attempt_options, attempt_prompt)
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append((reason, attempt_options, attempt_prompt))
-    return deduped
+def validate_manifest(manifest: object, image_count: int) -> list[dict[str, Any]]:
+    if manifest is None:
+        return []
+    if not isinstance(manifest, list):
+        raise CommandError("input_images_manifest must be an array")
+    seen: set[int] = set()
+    result: list[dict[str, Any]] = []
+    for item in manifest:
+        if not isinstance(item, dict) or set(item) - {"index", "filename", "role", "label"}:
+            raise CommandError("invalid reference image manifest item")
+        index = item.get("index")
+        if type(index) is not int or not 0 <= index < image_count or index in seen:
+            raise CommandError("manifest indexes must be unique valid zero-based image indexes")
+        if any(not isinstance(value, str) for key, value in item.items() if key != "index"):
+            raise CommandError("manifest filename, role and label must be strings")
+        seen.add(index)
+        result.append(dict(item))
+    return result
 
 
 def generation_payload(prompt: str, options: ImageOptions) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": options.model,
-        "prompt": styled_prompt(prompt, options.style),
-        "response_format": options.response_format,
-    }
-    maybe_set(payload, "size", options.size)
-    maybe_set(payload, "quality", options.quality)
-    maybe_set(payload, "output_format", options.output_format)
-    maybe_set(payload, "background", options.background)
-    maybe_set(payload, "moderation", options.moderation)
-    maybe_set(payload, "output_compression", options.output_compression)
-    if options.n > 1:
-        payload["n"] = options.n
+    validate_prompt(prompt, "generate")
+    validate_options(options, "generate")
+    payload: dict[str, Any] = {"model": options.model, "prompt": prompt, "response_format": options.response_format}
+    for key in ("size", "quality", "output_format", "background", "moderation", "style"):
+        value = getattr(options, key)
+        if value:
+            payload[key] = value
+    if options.output_compression is not None:
+        payload["output_compression"] = options.output_compression
     return payload
 
 
-def edit_payload(prompt: str, images: tuple[str, ...], options: ImageOptions) -> dict[str, Any]:
+def edit_payload(prompt: str, images: tuple[str, ...], options: ImageOptions, manifest: object = None) -> dict[str, Any]:
+    if not 1 <= len(images) <= MAX_IMAGE_INPUTS:
+        raise CommandError("edit requires 1 to 16 images")
     payload = generation_payload(prompt, options)
-    payload["images"] = [{"image_url": image} for image in images if image.strip()]
+    payload["images"] = [{"image_url": image} for image in images]
+    if manifest is not None:
+        payload["input_images_manifest"] = validate_manifest(manifest, len(images))
     return payload
 
 
-def job_payload(prompt: str, input_images: tuple[str, ...], options: ImageOptions) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": options.model,
-        "prompt": prompt.strip(),
-    }
-    maybe_set(payload, "size", options.size, omit_auto=True)
-    maybe_set(payload, "quality", options.quality, omit_auto=True)
-    maybe_set(payload, "output_format", options.output_format)
-    maybe_set(payload, "background", options.background, omit_auto=True)
-    maybe_set(payload, "style", options.style)
-    maybe_set(payload, "upscale", options.upscale)
+def job_payload(prompt: str, input_images: tuple[str, ...], options: ImageOptions, manifest: object = None) -> dict[str, Any]:
+    validate_prompt(prompt, "job")
+    validate_options(options, "job")
+    if len(input_images) > MAX_IMAGE_INPUTS:
+        raise CommandError("job accepts at most 16 input images")
+    payload: dict[str, Any] = {"model": options.model, "prompt": prompt, "n": options.n}
+    for key in ("size", "quality", "output_format", "background", "style", "upscale", "upscale_fit"):
+        value = getattr(options, key)
+        if value and value != "auto":
+            payload[key] = value
+    if options.strict_size is not None:
+        payload["strict_size"] = options.strict_size
     if input_images:
         payload["input_images"] = list(input_images)
+    if manifest is not None:
+        payload["input_images_manifest"] = validate_manifest(manifest, len(input_images))
     return payload

@@ -1,258 +1,188 @@
-import argparse
+import base64
 import contextlib
 import io
+import json
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
+from PIL import Image
 
-def base_args(**overrides: Any) -> argparse.Namespace:
-    values: dict[str, Any] = {
-        "model": "gpt-image-2",
-        "size": "auto",
-        "quality": "auto",
-        "output_format": "png",
-        "response_format": "b64_json",
-        "background": "auto",
-        "moderation": "low",
-        "output_compression": None,
-        "n": 1,
-        "style": "",
-        "upscale": "",
-        "timeout": 1,
-        "poll_interval": 0.01,
-        "auto_retry": False,
-    }
-    values.update(overrides)
-    return argparse.Namespace(**values)
+from codex2api_image import cli
+from codex2api_image.config import RuntimeConfig
+from codex2api_image.errors import CommandError
+from codex2api_image.http_client import Codex2APIClient
+
+
+def invoke(args):
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        code = cli.main(args)
+    return code, stdout.getvalue(), stderr.getvalue()
+
+
+def encoded_image():
+    stream = io.BytesIO()
+    Image.new("RGB", (16, 16)).save(stream, format="PNG")
+    return base64.b64encode(stream.getvalue()).decode()
 
 
 class CLIBehaviorTests(unittest.TestCase):
-    def test_parser_rejects_input_fidelity(self) -> None:
-        from codex2api_image.cli import build_parser
+    def setUp(self):
+        self.client = Codex2APIClient(RuntimeConfig("http://127.0.0.1:8080/v1", "test-only-key"))
 
-        parser = build_parser()
-        stderr = io.StringIO()
-        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
-            parser.parse_args(
-                [
-                    "edit",
-                    "--prompt",
-                    "test",
-                    "--image",
-                    "data:image/png;base64,AAAA",
-                    "--out",
-                    "out.png",
-                    "--input-fidelity",
-                    "high",
-                ]
-            )
+    def test_generate_dry_run_needs_no_credentials_or_client(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args", side_effect=AssertionError("must not load credentials")):
+            code, stdout, stderr = invoke(["generate", "--prompt", "  cat\n", "--out", str(Path(tmp) / "out.png"), "--dry-run"])
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["payload"]["prompt"], "  cat\n")
+            self.assertEqual(list(Path(tmp).iterdir()), [])
 
-    def test_batch_row_rejects_input_fidelity(self) -> None:
-        from codex2api_image.cli import build_options
-        from codex2api_image.errors import CommandError
+    def test_job_dry_run_preserves_exact_canvas_and_count(self):
+        code, stdout, _ = invoke(["job", "submit", "--prompt", "wallpaper", "--model", "gpt-image-2.5-flare", "--quality", "max",
+                                 "--size", "1920x1080", "--n", "4", "--strict-size", "--upscale-fit", "pad", "--dry-run"])
+        self.assertEqual(code, 0)
+        payload = json.loads(stdout)["payload"]
+        self.assertEqual((payload["size"], payload["n"], payload["quality"]), ("1920x1080", 4, "max"))
 
-        with self.assertRaisesRegex(CommandError, "input_fidelity"):
-            build_options(base_args(), {"input_fidelity": "high"})
-
-    def test_transparent_background_is_rejected(self) -> None:
-        from codex2api_image.cli import build_options
-        from codex2api_image.errors import CommandError
-
-        with self.assertRaisesRegex(CommandError, "transparent"):
-            build_options(base_args(background="transparent"))
-
-    def test_prompt_for_request_is_unchanged_by_default(self) -> None:
-        from codex2api_image.cli import prompt_for_request
-
-        self.assertEqual(prompt_for_request("remove background", base_args(), None), "remove background")
-
-    def test_prompt_for_request_wraps_when_cli_flag_enabled(self) -> None:
-        from codex2api_image.cli import prompt_for_request
-
-        prompt = prompt_for_request("remove background", base_args(clean_background=True), None)
-
-        self.assertIn("plain clean light background", prompt)
-        self.assertIn("User request: remove background", prompt)
-
-    def test_prompt_for_request_wraps_when_batch_row_enabled(self) -> None:
-        from codex2api_image.cli import prompt_for_request
-
-        prompt = prompt_for_request("remove background", base_args(), {"clean_background": True})
-
-        self.assertIn("plain clean light background", prompt)
-        self.assertIn("User request: remove background", prompt)
-
-    def test_prompt_for_request_batch_row_can_disable_global_flag(self) -> None:
-        from codex2api_image.cli import prompt_for_request
-
-        prompt = prompt_for_request("remove background", base_args(clean_background=True), {"clean_background": False})
-
-        self.assertEqual(prompt, "remove background")
-
-    def test_prompt_for_request_rejects_invalid_batch_clean_background(self) -> None:
-        from codex2api_image.cli import prompt_for_request
-        from codex2api_image.errors import CommandError
-
-        with self.assertRaisesRegex(CommandError, "clean_background"):
-            prompt_for_request("remove background", base_args(), {"clean_background": "maybe"})
-
-    def test_batch_output_paths_must_be_unique(self) -> None:
-        from codex2api_image.cli import ensure_unique_batch_outputs
-        from codex2api_image.errors import CommandError
-
+    def test_reference_dry_run_redacts_image_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            rows = [{"prompt": "a", "out": "same.png"}, {"prompt": "b", "out": "same.png"}]
-            with self.assertRaisesRegex(CommandError, "same.png"):
-                ensure_unique_batch_outputs(rows, Path(tmp))
+            image = "data:image/png;base64," + encoded_image()
+            code, stdout, _ = invoke(["edit", "--prompt", "cat", "--image", image, "--out", str(Path(tmp) / "out.png"), "--dry-run"])
+            self.assertEqual(code, 0)
+            self.assertNotIn("base64", stdout)
+            self.assertEqual(json.loads(stdout)["payload"]["images"], [{"image_url": "<image 1>"}])
 
-    def test_run_batch_rows_preserves_order_with_concurrency(self) -> None:
-        from codex2api_image.cli import run_batch_rows
+    def test_documented_generate_batch_works_without_images(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=[{"mode": "generate", "prompt": "A small orange cat", "out": "cat.png"}]), patch("codex2api_image.cli.client_from_args", side_effect=AssertionError("offline")):
+            code, stdout, stderr = invoke(["batch", "--input", "mock.json", "--out-dir", tmp, "--dry-run"])
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertEqual(json.loads(stdout)["jobs"][0]["route"], "/images/generations")
 
-        rows = [{"prompt": "slow"}, {"prompt": "fast"}]
+    def test_batch_preflight_prevents_partial_submission(self):
+        rows = [{"prompt": "valid"}, {"prompt": ""}]
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=rows), patch("codex2api_image.cli.client_from_args") as client:
+            code, _, stderr = invoke(["batch", "--input", "mock.json", "--out-dir", tmp])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(stderr)["error"]["index"], 2)
+            client.assert_not_called()
 
-        def runner(index: int, row: dict[str, Any]) -> dict[str, Any]:
-            if row["prompt"] == "slow":
-                time.sleep(0.05)
-            return {"index": index, "prompt": row["prompt"]}
+    def test_batch_output_collisions_and_traversal_prevent_submission(self):
+        for rows in ([{"prompt": "a", "out": "a.png"}, {"prompt": "b", "out": "A.png"}], [{"prompt": "a", "out": "../escape.png"}]):
+            with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=rows), patch("codex2api_image.cli.client_from_args") as client:
+                code, _, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp])
+                self.assertEqual(code, 1)
+                client.assert_not_called()
 
-        results = run_batch_rows(rows, concurrency=2, runner=runner)
-        self.assertEqual([item["prompt"] for item in results], ["slow", "fast"])
+    def test_batch_count_generated_paths_are_preflighted(self):
+        rows = [{"mode": "job", "prompt": "a", "n": 2, "out": "a.png"}, {"prompt": "b", "out": "a-001.png"}]
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=rows), patch("codex2api_image.cli.client_from_args") as client:
+            code, _, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp])
+            self.assertEqual(code, 1)
+            client.assert_not_called()
 
-    def test_run_batch_rows_records_job_index_on_failure(self) -> None:
-        from codex2api_image.cli import run_batch_rows
-        from codex2api_image.errors import CommandError
+    def test_batch_failures_return_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=[{"prompt": "a"}]), patch("codex2api_image.cli.client_from_args", return_value=self.client), patch("codex2api_image.cli.run_prepared", side_effect=CommandError("failed")):
+            code, stdout, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp])
+            self.assertEqual(code, 1)
+            self.assertEqual(json.loads(stdout)["failed"], 1)
 
-        def runner(index: int, row: dict[str, Any]) -> dict[str, Any]:
-            if index == 2:
-                raise CommandError("boom")
-            return {"index": index}
+    def test_batch_results_keep_input_order(self):
+        def finish(client, args, prepared):
+            if prepared.payload["prompt"] == "slow":
+                time.sleep(0.02)
+            return {"ok": True, "name": prepared.payload["prompt"]}
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=[{"prompt": "slow"}, {"prompt": "fast"}]), patch("codex2api_image.cli.client_from_args", return_value=self.client), patch("codex2api_image.cli.run_prepared", side_effect=finish):
+            code, stdout, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp, "--concurrency", "2"])
+            self.assertEqual(code, 0)
+            self.assertEqual([result["name"] for result in json.loads(stdout)["results"]], ["slow", "fast"])
 
-        results = run_batch_rows([{"prompt": "a"}, {"prompt": "b"}], concurrency=2, runner=runner)
+    def test_batch_unknown_fields_and_invalid_booleans_fail(self):
+        for row in ({"prompt": "a", "input_fidelity": "high"}, {"prompt": "a", "auto_retry": "true"}, {"prompt": "a", "images": [123]}):
+            with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=[row]), patch("codex2api_image.cli.client_from_args") as client:
+                code, _, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp])
+                self.assertEqual(code, 1)
+                client.assert_not_called()
 
-        self.assertEqual(results[0], {"index": 1})
-        self.assertEqual(results[1]["index"], 2)
-        self.assertFalse(results[1]["ok"])
-        self.assertIn("boom", results[1]["error"])
+    def test_existing_output_is_checked_before_request(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args") as client:
+            path = Path(tmp) / "out.png"
+            path.write_bytes(b"original")
+            code, _, _ = invoke(["generate", "--prompt", "cat", "--out", str(path)])
+            self.assertEqual(code, 1)
+            client.assert_not_called()
+            self.assertEqual(path.read_bytes(), b"original")
 
-    def test_batch_row_defaults_to_direct_edit_when_images_exist(self) -> None:
-        from codex2api_image.cli import run_batch_row
+    def test_job_timeout_never_resubmits_accepted_job(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args", return_value=self.client), patch.object(self.client, "request_with_retry", return_value=({"job": {"id": 9}}, [{"index": 1, "ok": True}])) as request, patch("codex2api_image.cli.wait_job", side_effect=CommandError("wait timed out", error_kind="job_timeout")):
+            code, _, stderr = invoke(["job", "run", "--prompt", "cat", "--out", str(Path(tmp) / "out.png"), "--auto-retry"])
+            self.assertEqual(code, 1)
+            self.assertEqual(request.call_count, 1)
+            self.assertEqual(json.loads(stderr)["error"]["job_id"], 9)
 
-        args = base_args(clean_background=False)
-        row = {
-            "prompt": "change outfit",
-            "_resolved_images": ["data:image/png;base64,AAAA"],
-            "out": "out.png",
-        }
+    def test_partial_job_keeps_files_and_warning_but_returns_nonzero(self):
+        job = {"id": 9, "status": "succeeded", "warning": "requested 4, completed 2", "params_json": json.dumps({"n": 4, "model": "gpt-image-2.5-flare"}),
+               "assets": [{"cache_b64_json": encoded_image()}, {"cache_b64_json": encoded_image()}]}
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args", return_value=self.client), patch("codex2api_image.cli.wait_job", return_value=job):
+            code, stdout, _ = invoke(["job", "wait", "9", "--out", str(Path(tmp) / "out.png")])
+            result = json.loads(stdout)
+            self.assertEqual(code, 1)
+            self.assertIn("completed 2", result["warning"])
+            self.assertEqual((result["requested_n"], result["completed_n"]), (4, 2))
+            self.assertEqual(len(list(Path(tmp).glob("*.png"))), 2)
 
-        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.save_sync_with_auto_retry") as save_sync, patch(
-            "codex2api_image.cli.run_job_with_auto_retry"
-        ) as run_job:
-            save_sync.return_value = (Path(tmp) / "out.png", [{"reason": "original", "ok": True}])
-            result = run_batch_row(object(), args, 1, row, Path(tmp))  # type: ignore[arg-type]
+    def test_dimension_mismatch_is_reported_without_local_resize(self):
+        job = {"id": 9, "status": "succeeded", "params_json": json.dumps({"n": 1, "size": "1920x1080"}), "assets": [{"cache_b64_json": encoded_image()}]}
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args", return_value=self.client), patch("codex2api_image.cli.wait_job", return_value=job):
+            code, stdout, _ = invoke(["job", "wait", "9", "--out", str(Path(tmp) / "out.png")])
+            result = json.loads(stdout)
+            self.assertEqual(code, 1)
+            self.assertEqual(result["images"][0]["width"], 16)
+            self.assertIn("1920x1080", result["warning"])
 
-        self.assertEqual(result["mode"], "edit")
-        save_sync.assert_called_once()
-        run_job.assert_not_called()
+    def test_generate_saves_and_reports_actual_image(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args", return_value=self.client), patch.object(self.client, "request_json", return_value={"data": [{"b64_json": encoded_image()}]}):
+            code, stdout, stderr = invoke(["generate", "--prompt", "cat", "--out", str(Path(tmp) / "out.png")])
+            result = json.loads(stdout)
+            self.assertEqual((code, stderr), (0, ""))
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["images"][0]["width"], 16)
+            self.assertGreater(result["images"][0]["bytes"], 0)
 
-    def test_auto_retry_can_be_enabled_per_batch_row(self) -> None:
-        from codex2api_image.cli import auto_retry_enabled
+    def test_invalid_timeouts_do_not_create_client(self):
+        for timeout in ("0", "-1", "nan", "inf"):
+            with patch("codex2api_image.cli.client_from_args") as client:
+                code, _, _ = invoke(["models", "--timeout", timeout])
+                self.assertEqual(code, 1)
+                client.assert_not_called()
 
-        self.assertTrue(auto_retry_enabled(base_args(), {"auto_retry": True}))
-        self.assertFalse(auto_retry_enabled(base_args(auto_retry=True), {"auto_retry": False}))
+    def test_empty_batch_is_not_success(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=[]):
+            code, _, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp, "--dry-run"])
+            self.assertEqual(code, 1)
 
-    def test_hard_sensitive_refusal_is_detected(self) -> None:
-        from codex2api_image.cli import is_image_output_rejection, is_sensitive_refusal
+    def test_clean_background_can_only_be_explicitly_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = ["generate", "--prompt", "keep my subject", "--out", str(Path(tmp) / "out.png"), "--dry-run"]
+            _, stdout, _ = invoke(args)
+            self.assertEqual(json.loads(stdout)["payload"]["prompt"], "keep my subject")
+            _, stdout, _ = invoke(args + ["--clean-background"])
+            self.assertIn("User request: keep my subject", json.loads(stdout)["payload"]["prompt"])
 
-        error = "HTTP 422 Unprocessable Entity: image_output_rejected: Sorry, I can’t help create a nude version of this scene."
+    def test_expected_format_collision_is_checked_before_request(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.client_from_args") as client:
+            path = Path(tmp) / "out.jpg"
+            path.write_bytes(b"original")
+            code, _, _ = invoke(["generate", "--prompt", "cat", "--output-format", "jpeg", "--out", str(Path(tmp) / "out.png")])
+            self.assertEqual(code, 1)
+            client.assert_not_called()
+            self.assertEqual(path.read_bytes(), b"original")
 
-        self.assertTrue(is_image_output_rejection(error))
-        self.assertTrue(is_sensitive_refusal(error))
-
-    def test_sexualized_soft_rejection_can_try_prompt_reframes(self) -> None:
-        from codex2api_image.cli import is_image_output_rejection, is_sensitive_refusal
-
-        error = "HTTP 422 Unprocessable Entity: image_output_rejected: request may sexualize non-sensitive non-explicit visible legs/footwear."
-
-        self.assertTrue(is_image_output_rejection(error))
-        self.assertFalse(is_sensitive_refusal(error))
-
-    def test_policy_rejection_stops_before_technical_fallbacks(self) -> None:
-        from codex2api_image.cli import save_sync_with_auto_retry
-        from codex2api_image.errors import CommandError
-        from codex2api_image.payloads import ImageOptions
-
-        args = base_args(auto_retry=True)
-        calls: list[str] = []
-
-        def reject(*_args: Any, **kwargs: Any) -> dict[str, Any]:
-            calls.append(kwargs["options"].output_format)
-            raise CommandError("HTTP 422 Unprocessable Entity: image_output_rejected")
-
-        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.request_once", reject):
-            with self.assertRaisesRegex(CommandError, "all image attempts failed"):
-                save_sync_with_auto_retry(
-                    client=object(),  # type: ignore[arg-type]
-                    args=args,
-                    row=None,
-                    prompt="upscale this specific image",
-                    options=ImageOptions(model="gpt-image-2", output_format="png"),
-                    mode="edit",
-                    images=("data:image/png;base64,AAAA",),
-                    out=Path(tmp) / "out.png",
-                )
-
-        self.assertEqual(calls, ["png", "png", "png", "png", "png"])
-
-    def test_policy_prompt_reasons_match_retry_plan(self) -> None:
-        from codex2api_image.cli import is_policy_prompt_retry
-        from codex2api_image.payloads import ImageOptions, auto_retry_attempts
-
-        reasons = [reason for reason, _, _ in auto_retry_attempts("enhance", ImageOptions(output_format="png"))]
-        policy_reasons = [reason for reason in reasons if is_policy_prompt_retry(reason)]
-
-        self.assertEqual(
-            policy_reasons,
-            [
-                "original",
-                "sanitized_user_prompt",
-                "t1_conservative_restoration_prompt",
-                "t2_conservative_quality_cleanup_prompt",
-                "t3_modest_outfit_reframe_prompt",
-            ],
-        )
-
-    def test_hard_sensitive_refusal_stops_immediately(self) -> None:
-        from codex2api_image.cli import save_sync_with_auto_retry
-        from codex2api_image.errors import CommandError
-        from codex2api_image.payloads import ImageOptions
-
-        args = base_args(auto_retry=True)
-        calls = 0
-
-        def reject(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
-            nonlocal calls
-            calls += 1
-            raise CommandError("HTTP 422 Unprocessable Entity: image_output_rejected nude version")
-
-        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.request_once", reject):
-            with self.assertRaisesRegex(CommandError, "sensitive image refusal"):
-                save_sync_with_auto_retry(
-                    client=object(),  # type: ignore[arg-type]
-                    args=args,
-                    row=None,
-                    prompt="enhance",
-                    options=ImageOptions(model="gpt-image-2", output_format="png"),
-                    mode="edit",
-                    images=("data:image/png;base64,AAAA",),
-                    out=Path(tmp) / "out.png",
-                )
-
-        self.assertEqual(calls, 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_batch_different_extensions_cannot_resolve_to_same_file(self):
+        rows = [{"prompt": "a", "out": "a.png", "output_format": "jpeg"}, {"prompt": "b", "out": "a.jpg", "output_format": "jpeg"}]
+        with tempfile.TemporaryDirectory() as tmp, patch("codex2api_image.cli.read_jobs", return_value=rows), patch("codex2api_image.cli.client_from_args") as client:
+            code, _, _ = invoke(["batch", "--input", "mock.json", "--out-dir", tmp])
+            self.assertEqual(code, 1)
+            client.assert_not_called()

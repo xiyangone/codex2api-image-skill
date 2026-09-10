@@ -1,172 +1,109 @@
-# Commands
+# CLI 命令与维护
 
-Run from the skill directory:
-
-```powershell
-cd C:\Users\21218\.codex\skills\codex2api-image
-uv run codex2api-image <command>
-```
-
-Global API options are available on API commands:
-
-- `--base-url` overrides `CODEX2API_BASE_URL`.
-- `--api-key` overrides `CODEX2API_API_KEY`; do not print it.
-- `--env-file` selects a dotenv file.
-- `--timeout` defaults to `900`.
-
-Image commands also support `--clean-background` and `--auto-retry`. Both are explicit opt-in only: the default behavior sends the prompt unchanged. Use `--clean-background` for conservative plain-background cleanup, not for transparent output. Use `--auto-retry` only when failure recovery should try conservative prompt rewrites, JPEG fallback, lower quality, and lower resolution. Policy refusals stay on prompt-frame retries and do not fall through to technical format/quality/size downgrades.
-
-Default to direct API routes. For parallel testing, use `batch --concurrency N` with normal `edit` or `generate` rows; this runs direct API calls concurrently and keeps each row's output path and retry log separate. Use `mode=job` only as a backup for long-running tasks or when direct API is unstable.
-
-## `models`
+在 skill 目录运行，使用锁定依赖：
 
 ```powershell
-uv run codex2api-image models
+Set-Location 'C:\Users\21218\.codex\skills\codex2api-image'
+uv run --locked codex2api-image --version
+uv run --locked codex2api-image generate --help
 ```
 
-## `generate`
+## 配置与公共选项
+
+- `--base-url` / `CODEX2API_BASE_URL`：明确选择服务，默认 `http://127.0.0.1:8080/v1`。
+- `--env-file` / `CODEX2API_IMAGE_ENV_FILE`：选择配置文件，默认 skill 的 `.env`；明确指定但不存在会报错。
+- `CODEX2API_API_KEY`：进程值优先于文件。`--api-key` 也可显式覆盖，但不要把密钥放进命令历史或文档。
+- 不读取通用 `OPENAI_API_KEY/OPENAI_BASE_URL`，避免与其他服务混配。
+- `--timeout`：默认 900 秒，提供请求 I/O 超时及重试 / 轮询预算；不代表取消服务端任务。
+- `--auto-retry`：明确启用有限失败恢复；`--max-attempts` 默认 3，包含首次请求。不开启时只有一次请求。
+- `--dry-run`：适用于 generate、edit、job submit/run 和 batch；完全不需要密钥，不联网、不创建输出文件。
+
+图像参数：`--model`、`--size`、`--quality`、`--output-format png|jpeg|webp`、`--background auto|opaque`、`--style`、`--clean-background`。
+同步专用：`--response-format b64_json|url`、`--moderation auto|low`、JPEG/WebP 的 `--output-compression 0..100`。不默认指定 moderation。
+Job 专用：`--n 1..4`、`--upscale 2k|4k`、`--strict-size/--no-strict-size`、`--upscale-fit pad|cover`。不支持的跨路由参数会报错，不再静默忽略。
+
+## 模型目录与同步请求
 
 ```powershell
-uv run codex2api-image generate `
-  --prompt "..." `
-  --model gpt-image-2 `
-  --size auto `
-  --quality auto `
-  --output-format png `
-  --background auto `
-  --moderation low `
-  --out G:\out\image.png
+uv run --locked codex2api-image models
+uv run --locked codex2api-image generate --prompt 'A small orange cat by a sunny window' --model gpt-image-2.5-flare --quality xhigh --size 1024x1024 --out 'G:\out\cat-new.png'
+uv run --locked codex2api-image edit --prompt 'Replace only the background with clean light gray' --image 'G:\in\source.png' --model gpt-image-2.5-sunburst --quality high --out 'G:\out\edited-new.png'
 ```
 
-Use `--dry-run` to print the JSON payload without sending.
+重复 `--image` 添加参考图，最多 16 张，每张本地 / data URL 图片不超过 20 MiB。第一张是编辑目标。`--manifest 'G:\in\references.json'` 可传入角色元数据：
 
-## `edit`
+```json
+[
+  {"index": 0, "filename": "source.png", "role": "source", "label": "编辑目标"},
+  {"index": 1, "filename": "face.png", "role": "identity", "label": "脸部参考"}
+]
+```
+
+索引从 0 开始，必须唯一且对应输入图。元数据不改提示词；每张参考图的实际用途仍需在用户提示词中写清楚。
+
+## 精确尺寸、多图与续查
 
 ```powershell
-uv run codex2api-image edit `
-  --prompt "..." `
-  --image G:\in\primary.png `
-  --image G:\in\reference.png `
-  --model gpt-image-2 `
-  --out G:\out\edited.png
+uv run --locked codex2api-image job run --prompt 'A quiet landscape wallpaper' --model gpt-image-2.5-flare --size 1920x1080 --n 2 --strict-size --upscale-fit pad --out 'G:\out\wallpaper-new.png'
+uv run --locked codex2api-image job submit --prompt 'A quiet landscape' --model gpt-image-2.5-sunburst --n 2
+uv run --locked codex2api-image job wait 123 --out-dir 'G:\out\job-123-new'
 ```
 
-`--image` accepts local image paths, `file://`, HTTP(S), and `data:image/...;base64,...`.
+`job run/wait` 必须明确指定 `--out` 或 `--out-dir`，两者不能并用。单张使用给定文件名；多张与 `--out` 配合时保存为 `stem-001.ext`、`stem-002.ext` 等。`--out-dir` 使用经过目录边界校验的服务端文件名。
 
-`gpt-image-2*` uses its own image-input fidelity behavior. Do not pass old input-fidelity fields.
-Use prompt text such as "plain clean background" for requests like "no background"; do not request transparent output.
-Use `--clean-background` only when a more conservative plain-background rewrite is wanted.
-Use `--auto-retry` only when failures should be retried with a recorded fallback sequence.
+等待超时或下载失败后，继续 `job wait`，不要再次 `job run`。若部分文件已存在，应指定新的输出文件名或目录；不会覆盖已有产物。
 
-Explicit clean-background mode:
-
-```powershell
-uv run codex2api-image edit `
-  --prompt "remove the background" `
-  --image G:\in\primary.png `
-  --clean-background `
-  --out G:\out\clean-bg.png
-```
-
-Explicit auto-retry mode:
-
-```powershell
-uv run codex2api-image edit `
-  --prompt "Change only the shoes; preserve everything else" `
-  --image G:\in\primary.png `
-  --model gpt-image-2-4k `
-  --quality high `
-  --output-format png `
-  --auto-retry `
-  --out G:\out\edit-retry.png
-```
-
-## `job`
-
-Submit only:
-
-```powershell
-uv run codex2api-image job submit --prompt "..." --model gpt-image-2-4k
-```
-
-Wait and save an existing job:
-
-```powershell
-uv run codex2api-image job wait 123 --out G:\out\job.png
-```
-
-Submit, wait, and save. This is a backup route, not the default path:
-
-```powershell
-uv run codex2api-image job run `
-  --prompt "..." `
-  --image G:\in\primary.png `
-  --model gpt-image-2-4k `
-  --upscale 4k `
-  --out G:\out\job.png
-```
-
-## `asset save`
-
-Use for signed asset URLs returned as `proxy_url`:
-
-```powershell
-uv run codex2api-image asset save `
-  --url "/p/img/123?exp=...&sig=..." `
-  --out G:\out\asset.png
-```
-
-## `batch`
-
-```powershell
-uv run codex2api-image batch --input G:\batch.json --out-dir G:\out --concurrency 3
-```
-
-`--concurrency` defaults to `3`. Results are printed in input order. If any row fails, already-started rows finish and successful outputs remain saved; failed rows are returned as JSON entries with `"ok": false`. Direct API parallelism is implemented here; it does not require `/v1/images/jobs`.
-
-Batch JSON:
+## 批量任务
 
 ```json
 {
   "jobs": [
-    {
-      "mode": "generate",
-      "prompt": "A small orange cat",
-      "model": "gpt-image-2",
-      "size": "1024x1024",
-      "quality": "high",
-      "out": "cat.png"
-    },
-    {
-      "mode": "edit",
-      "prompt": "Replace the background",
-      "images": ["G:/in/source.png"],
-      "clean_background": true,
-      "out": "edit.png"
-    },
-    {
-      "mode": "job",
-      "prompt": "High resolution pass",
-      "input_images": ["G:/in/source.png"],
-      "model": "gpt-image-2-4k",
-      "upscale": "4k",
-      "auto_retry": true,
-      "out": "job.png"
-    }
+    {"mode": "generate", "prompt": "A small orange cat", "model": "gpt-image-2.5-flare", "quality": "high", "out": "cat.png"},
+    {"mode": "edit", "prompt": "Replace only the background", "images": ["G:/in/source.png"], "out": "edited.png"},
+    {"mode": "job", "prompt": "A quiet wallpaper", "size": "1920x1080", "n": 2, "strict_size": true, "upscale_fit": "pad", "out": "wallpaper.png"}
   ]
 }
 ```
 
-If `mode` is omitted, rows with images use direct API `edit`; rows without images use direct API `generate`.
-
-Batch rows may set `"clean_background": true` for the explicit conservative prompt wrapper, or `false` to disable a global `--clean-background` flag for that row. Batch rows may also set `"auto_retry": true` to enable fallback retries, or `false` to disable a global `--auto-retry` flag for that row.
-
-Batch rows must not include old input-fidelity fields. Output filenames must be unique after joining with `--out-dir`.
-
-## `info`
-
 ```powershell
-uv run codex2api-image info G:\out\image.png
+uv run --locked codex2api-image batch --input 'G:\batch.json' --out-dir 'G:\out\batch-new' --dry-run
+uv run --locked codex2api-image batch --input 'G:\batch.json' --out-dir 'G:\out\batch-new' --concurrency 2
 ```
 
-Reports local kind, width, height, and bytes.
+省略 mode 时，有图片为 edit，无图片为 generate。合法 mode 只有 generate、edit、job。输出必须是目录内的相对名称，不能使用绝对路径、`..` 或重复目标。
+
+整批先校验提示词、图片、参数与输出路径，再发送请求；空批次或任一输入不合法时不提交任何任务。结果按输入顺序排列。每行可设置 JSON 布尔值 `auto_retry`、`clean_background` 以及 `input_images_manifest`；未知字段会报错。
+
+## 下载与校验
+
+```powershell
+uv run --locked codex2api-image asset save --url '/p/img/123?exp=...&sig=...' --out 'G:\out\asset-new.png'
+uv run --locked codex2api-image info 'G:\out\asset-new.png'
+```
+
+保存全部返回图片。若响应格式与指定扩展名不符，使用实际格式对应的扩展名并报告真实路径；不会重新编码图片。文件和 data URL 均须通过完整图片解码校验。
+
+## 结果与退出码
+
+成功报告包含 `saved[]`、`images[]`（路径、格式、宽高、字节数）、`model`（请求模型）、`requested_n/completed_n`、`warning` 和尝试记录。Job 还包含 `job_id`。
+
+- `0`：命令成功且输出完整；成功的 dry-run 也为 0。
+- `1`：请求 / 配置 / 文件失败、部分成功、job 尺寸不符或服务端警告。已保存文件保留。
+- `2`：CLI 参数解析错误。
+
+单命令错误是 stderr JSON；批量结果与部分成功报告在 stdout JSON 中。不要只看 HTTP 200 判断成功。
+
+## 项目依赖维护
+
+运行依赖只有 Pillow（解码验证）；开发依赖统一放在 `dependency-groups.dev`，不再维护 dev extra。Python 要求 `>=3.11`；更新项目依赖不自动升级全局 uv 或 Python。
+
+以下维护命令会修改锁文件或虚拟环境，执行前遵守用户的写入范围确认：
+
+```powershell
+uv lock --upgrade
+uv sync --locked --group dev
+uv run --locked python -B -m unittest discover -s tests -v
+uv run --locked pyright
+```
+
+需要只读查看升级候选时使用 `uv lock --upgrade --dry-run`。普通调用使用 `uv run --locked`，不应临时安装未声明依赖。

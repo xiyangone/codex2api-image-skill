@@ -1,134 +1,88 @@
 import unittest
+from dataclasses import replace
+
+from codex2api_image.errors import CommandError
+from codex2api_image.payloads import ImageOptions, clean_background_prompt, edit_payload, generation_payload, job_payload
 
 
 class PayloadTests(unittest.TestCase):
-    def test_clean_background_prompt_is_explicit_and_preserves_user_request(self) -> None:
-        from codex2api_image.payloads import clean_background_prompt
+    def test_new_models_quality_and_snapshots_pass_through(self):
+        for model in ("gpt-image-2.5-flare", "gpt-image-2.5-sunburst-4k", "gpt-image-2.5-flare-2026-09-09-2k"):
+            for quality in ("xhigh", "max"):
+                with self.subTest(model=model, quality=quality):
+                    payload = generation_payload("draw a cat", ImageOptions(model=model, quality=quality))
+                    self.assertEqual(payload["model"], model)
+                    self.assertEqual(payload["quality"], quality)
 
-        prompt = clean_background_prompt("remove the background")
+    def test_default_image_model_stays_image_2(self):
+        self.assertEqual(generation_payload("cat", ImageOptions())["model"], "gpt-image-2")
 
-        self.assertIn("plain clean light background", prompt)
-        self.assertIn("not transparent", prompt.lower())
-        self.assertIn("User request: remove the background", prompt)
+    def test_legacy_model_does_not_silently_downgrade_quality(self):
+        for model in ("gpt-image-2", "gpt-image-2-4k"):
+            with self.assertRaises(CommandError):
+                generation_payload("cat", ImageOptions(model=model, quality="max"))
 
-    def test_generation_payload_omits_size_when_requested(self) -> None:
-        from codex2api_image.payloads import ImageOptions, generation_payload
+    def test_prompt_is_byte_for_byte_unchanged_without_explicit_transform(self):
+        prompt = "  中文猫咪\nkeep this composition  "
+        self.assertEqual(generation_payload(prompt, ImageOptions())["prompt"], prompt)
+        self.assertEqual(job_payload(prompt, (), ImageOptions())["prompt"], prompt)
 
-        payload = generation_payload(
-            prompt="draw",
-            options=ImageOptions(model="gpt-image-2", size="omit", quality="high", output_format="png"),
-        )
-        self.assertEqual(payload["model"], "gpt-image-2")
-        self.assertEqual(payload["prompt"], "draw")
-        self.assertEqual(payload["quality"], "high")
-        self.assertEqual(payload["output_format"], "png")
-        self.assertNotIn("size", payload)
+    def test_sync_size_is_validated_not_rounded(self):
+        with self.assertRaisesRegex(CommandError, "job"):
+            generation_payload("wallpaper", ImageOptions(size="1920x1080"))
+        self.assertEqual(generation_payload("wallpaper", ImageOptions(size="1920x1088"))["size"], "1920x1088")
 
-    def test_edit_payload_uses_images_array(self) -> None:
-        from codex2api_image.payloads import ImageOptions, edit_payload
+    def test_job_preserves_canvas_count_and_fit(self):
+        payload = job_payload("wallpaper", (), ImageOptions(size="1920x1080", n=4, strict_size=True, upscale_fit="pad"))
+        self.assertEqual(payload["size"], "1920x1080")
+        self.assertEqual(payload["n"], 4)
+        self.assertIs(payload["strict_size"], True)
+        self.assertEqual(payload["upscale_fit"], "pad")
 
-        payload = edit_payload(
-            prompt="edit",
-            images=("data:image/png;base64,AAAA",),
-            options=ImageOptions(model="gpt-image-2"),
-        )
-        self.assertEqual(payload["model"], "gpt-image-2")
-        self.assertEqual(payload["images"], [{"image_url": "data:image/png;base64,AAAA"}])
-        self.assertNotIn("input_fidelity", payload)
+    def test_sync_rejects_ignored_job_parameters(self):
+        for options in (ImageOptions(n=2), ImageOptions(upscale="4k"), ImageOptions(strict_size=True), ImageOptions(upscale_fit="cover")):
+            with self.subTest(options=options), self.assertRaises(CommandError):
+                generation_payload("cat", options)
 
-    def test_auto_retry_attempts_include_prompt_and_parameter_fallbacks(self) -> None:
-        from codex2api_image.payloads import ImageOptions, auto_retry_attempts
+    def test_job_rejects_ignored_sync_parameters(self):
+        for options in (ImageOptions(response_format="url"), ImageOptions(moderation="low"), ImageOptions(output_format="jpeg", output_compression=80)):
+            with self.subTest(options=options), self.assertRaises(CommandError):
+                job_payload("cat", (), options)
 
-        attempts = auto_retry_attempts(
-            "upscale this specific image while preserving identity",
-            ImageOptions(model="gpt-image-2-4k", size="2048x2048", quality="high", output_format="png", upscale="4k"),
-        )
+    def test_size_and_parameter_boundaries(self):
+        values = [ImageOptions(size="0x16"), ImageOptions(size="4096x4096"), ImageOptions(size="4096x16"),
+                  ImageOptions(size="bad"), ImageOptions(n=0), ImageOptions(n=5), ImageOptions(background="transparent"),
+                  ImageOptions(output_compression=101), ImageOptions(output_format="gif"), ImageOptions(quality="wrong")]
+        for options in values:
+            with self.subTest(options=options), self.assertRaises(CommandError):
+                job_payload("cat", (), options)
 
-        reasons = [reason for reason, _, _ in attempts]
-        self.assertEqual(
-            reasons,
-            [
-                "original",
-                "sanitized_user_prompt",
-                "t1_conservative_restoration_prompt",
-                "t2_conservative_quality_cleanup_prompt",
-                "t3_modest_outfit_reframe_prompt",
-                "png_to_jpeg",
-                "quality_auto",
-                "quality_low",
-                "lower_resolution_default",
-            ],
-        )
-        lowered = attempts[-1][1]
-        self.assertEqual(lowered.model, "gpt-image-2")
-        self.assertEqual(lowered.size, "auto")
-        self.assertEqual(lowered.quality, "auto")
-        self.assertEqual(lowered.output_format, "jpeg")
-        self.assertEqual(lowered.upscale, "")
+    def test_edit_requires_valid_image_count(self):
+        for images in ((), tuple("x" for _ in range(17))):
+            with self.assertRaises(CommandError):
+                edit_payload("cat", images, ImageOptions())
 
-    def test_auto_retry_policy_prompts_avoid_specific_person_rejection_terms(self) -> None:
-        from codex2api_image.payloads import ImageOptions, auto_retry_attempts
+    def test_manifest_is_metadata_not_prompt_rewriting(self):
+        manifest = [{"index": 0, "role": "identity", "filename": "face.png", "label": "reference"}]
+        payload = edit_payload("change background", ("image",), ImageOptions(), manifest)
+        self.assertEqual(payload["prompt"], "change background")
+        self.assertEqual(payload["input_images_manifest"], manifest)
 
-        attempts = auto_retry_attempts(
-            "upscale this specific image while preserving identity, face, and body shape",
-            ImageOptions(model="gpt-image-2", output_format="png"),
-        )
+    def test_invalid_manifests_fail(self):
+        for manifest in ([{"index": 1}], [{"index": 0}, {"index": 0}], [{"index": True}], [{"index": 0, "role": 1}]):
+            with self.subTest(manifest=manifest), self.assertRaises(CommandError):
+                edit_payload("cat", ("image",), ImageOptions(), manifest)
 
-        policy_prompts = [attempt_prompt.lower() for reason, _, attempt_prompt in attempts[1:5]]
-        forbidden = [
-            "upscale this specific image",
-            "edit this particular image",
-            "preserve identity",
-            "identity",
-            "person",
-            "face",
-            "body shape",
-            "version",
-        ]
-        for attempt_prompt in policy_prompts:
-            for term in forbidden:
-                self.assertNotIn(term, attempt_prompt)
-        self.assertIn("sanitized user request", policy_prompts[0])
-        self.assertIn("conservative photo restoration pass", policy_prompts[1])
-        self.assertIn("conservative quality cleanup", policy_prompts[2])
-        self.assertNotIn("high-resolution finished version", policy_prompts[2])
-        self.assertNotIn("create a new version", policy_prompts[2])
+    def test_clean_background_is_explicit_and_preserves_request(self):
+        prompt = "保留主体，只换背景"
+        self.assertIn(prompt, clean_background_prompt(prompt))
+        self.assertEqual(generation_payload(prompt, ImageOptions())["prompt"], prompt)
 
-    def test_auto_retry_parameter_downgrades_happen_after_policy_prompts(self) -> None:
-        from codex2api_image.payloads import ImageOptions, auto_retry_attempts
+    def test_job_prompt_limit(self):
+        with self.assertRaises(CommandError):
+            job_payload("x" * 8001, (), ImageOptions())
 
-        reasons = [
-            reason
-            for reason, _, _ in auto_retry_attempts(
-                "enhance",
-                ImageOptions(model="gpt-image-2-4k", quality="high", output_format="png", upscale="4k"),
-            )
-        ]
-
-        self.assertLess(reasons.index("t2_conservative_quality_cleanup_prompt"), reasons.index("png_to_jpeg"))
-        self.assertLess(reasons.index("t3_modest_outfit_reframe_prompt"), reasons.index("png_to_jpeg"))
-        self.assertLess(reasons.index("t2_conservative_quality_cleanup_prompt"), reasons.index("quality_auto"))
-        self.assertLess(reasons.index("t2_conservative_quality_cleanup_prompt"), reasons.index("lower_resolution_default"))
-        self.assertNotIn("t3_production_artwork_prompt", reasons)
-        self.assertNotIn("t4_illustrated_final_render_prompt", reasons)
-
-    def test_auto_retry_adds_closed_foot_tights_prompt_for_white_tights_requests(self) -> None:
-        from codex2api_image.payloads import ImageOptions, auto_retry_attempts
-
-        attempts = auto_retry_attempts(
-            "裸足白丝手机壁纸",
-            ImageOptions(model="gpt-image-2-4k", size="1024x1792", quality="high", output_format="png"),
-        )
-
-        reasons = [reason for reason, _, _ in attempts]
-        self.assertIn("t4_closed_foot_tights_reframe_prompt", reasons)
-        prompt = dict((reason, attempt_prompt) for reason, _, attempt_prompt in attempts)["t4_closed_foot_tights_reframe_prompt"].lower()
-        self.assertIn("smooth closed-foot opaque white tights", prompt)
-        self.assertIn("continuous soft fabric", prompt)
-        self.assertIn("not toe-sock styling", prompt)
-        self.assertNotIn("barefoot", prompt)
-        self.assertNotIn("toes", prompt)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_non_integer_counts_and_compression(self):
+        for options in (replace(ImageOptions(), n=True), replace(ImageOptions(), output_compression=True)):
+            with self.assertRaises(CommandError):
+                generation_payload("cat", options)
