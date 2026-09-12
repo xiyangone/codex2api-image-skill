@@ -3,7 +3,7 @@
 ## 四层证据分开记录
 
 1. `/health` 成功：传输和健康入口可达。
-2. `models` 成功：当前 API Key 能读取目录。
+2. `models` 成功：当前 API Key 能读取自身可见目录，不等于有图片模型权限。
 3. 图片请求被接受 / job 可查询：该次业务请求状态可读。
 4. 图片已下载并完整解码：文件存在且尺寸、格式可确认；内容质量仍需目视验收。
 
@@ -24,17 +24,26 @@
 | 503 但没有可用退避信息、无账号、额度已耗尽 | 报告服务 / 账号池状态，不盲目连续生成 |
 | 明确内容拒绝、image_output_rejected、policy_* | 保留脱敏证据并停止，不换话术或降档尝试 |
 | POST 连接 / 读取超时，未拿到可靠结果 | outcome_unknown；不能判断是否已经受理，不自动重发 |
-| job 等待超时 | 报告 job_id，用同一 Key 执行 job wait，不新建任务 |
+| models 中没有图片模型 | 报告当前 key 可见目录缺少目标模型；账号范围、分组、通道或模型策略都可能影响，不直接判定版本不支持、不自动探测生成 |
+| job 持续 queued | 任务已受理但尚未取得执行容量；先 job status，不重复提交，也不把排队当作提示词失败 |
+| job 等待超时 | 根据 error.phase 区分 queue/execution；保留 job_id，用同一 Key 执行 job status/wait，调整对应预算，不新建任务 |
+| 中断 job wait | 只结束本次客户端等待，服务端任务未取消；按报告的 ID 续查 |
 | job 成功但 warning 非空或图片数不足 | 保留已保存文件，报告部分成功，退出码非零 |
+| job failed/cancelled 但 asset_count 大于零 | 显式 job download 取回已有图片；返回非零及原错误，不能称为生成成功 |
+| job 下载失败或 phase=download | 用 job download 重新读取现有任务并取得资源；不要再次 job run |
 | job 物理尺寸不符 | 保留原图，报告期望与实际尺寸，不本地缩放 |
 | 输出已存在、路径越界或文件无效 | 拒绝写入；修正位置后下载已有任务，不重生成 |
 | 图片 URL 重定向 | 客户端不会携带凭据追随重定向；先核对资源地址和服务反代配置 |
 
 v2.9.5 新增账号瞬时限流短冻结和有界调度等待队列；这些是基础设施状态，不是提示词问题。文本驱动模型选择和回退属于服务端设置，不要误改 CLI 的图像模型或后台全局配置。
 
+本地图片队列扩展将排队与执行分开。CLI 默认排队 900 秒、执行每张 900 秒、整组下载 900 秒，不再共用一个 900 秒总预算；显式 execution-timeout 是整个任务的值。服务端允许长时间排队不意味着客户端必须等待 24 小时。公开 API 没有取消路由，不猜测路径或借用后台接口取消。
+
 ## 错误报告
 
-单命令失败在 stderr 输出 JSON；包含可用的 route、status_code、error_kind、body、retry_after、job_id、outcome_unknown 和 attempts。响应体会脱敏，超大错误体可能截断。批量结果按输入顺序输出，failed 大于零时退出码为 1。
+命令异常在 stderr 输出 JSON 错误行；包含可用的 route、status_code、error_kind、body、retry_after、job_id、outcome_unknown 和 attempts。任务错误另提供 phase、当前状态/进度或 next_command 等恢复信息。响应体会脱敏，超大错误体可能截断。
+
+默认进度也是 stderr JSON 行，带 `event=job_progress`，只有状态或数量变化才输出；解析时逐行处理，或用 --no-progress 关闭。stdout 保留一次最终结果。job status 的查询结果、job download 的资产恢复结果以及批量结果都在 stdout；失败/取消状态或警告仍返回 1。batch 的最终结果按输入顺序排列，failed 大于零时退出码为 1。
 
 保存失败不触发第二次生成。部分落盘时报告 saved 或 partial_path；不要把残缺文件作为成功产物。
 

@@ -1,6 +1,6 @@
 [project]
 name = "codex2api-image"
-version = "0.3.0"
+version = "0.4.0"
 description = "API-key-only CLI for local codex2api image endpoints."
 requires-python = ">=3.11"
 dependencies = ["Pillow>=12.3.0,<13"]

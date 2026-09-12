@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, fields
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from . import __version__
@@ -17,11 +17,16 @@ from .errors import CommandError
 from .http_client import Codex2APIClient
 from .image_info import image_info
 from .images import final_output_path, image_sources_to_urls, save_asset_url, save_response_images
-from .jobs import response_job, response_job_id, save_job_assets, wait_job
+from .jobs import (
+    DEFAULT_DOWNLOAD_TIMEOUT, DEFAULT_QUEUE_TIMEOUT, FAILED_JOB_STATUSES, TERMINAL_JOB_STATUSES,
+    get_job, job_failure, job_params, job_snapshot, response_job, response_job_id, save_job_assets,
+    validate_job_id, validate_timeout, wait_job,
+)
 from .paths import contained_output, ensure_distinct_outputs, output_targets, resolve_output
 from .payloads import ImageOptions, clean_background_prompt, edit_payload, generation_payload, job_payload, parse_size
 
 ROUTES = {"generate": "/images/generations", "edit": "/images/edits", "job": "/images/jobs"}
+_PROGRESS_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -150,6 +155,65 @@ def saved_report(saved: list[Path], *, model: str, requested_n: int, size: str =
             "requested_n": requested_n, "completed_n": len(saved), "warning": "; ".join(warnings)}
 
 
+def print_job_progress(snapshot: dict[str, Any]) -> None:
+    line = json.dumps({"event": "job_progress", **snapshot}, ensure_ascii=False)
+    with _PROGRESS_LOCK:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
+def wait_for_job(client: Codex2APIClient, args: argparse.Namespace, job_id: int, *, auto_retry: bool) -> dict[str, Any]:
+    try:
+        return wait_job(client, job_id, args.timeout, args.poll_interval,
+                        queue_timeout=args.queue_timeout, execution_timeout=args.execution_timeout,
+                        on_progress=print_job_progress if args.progress else None,
+                        auto_retry=auto_retry, max_attempts=args.max_attempts)
+    except KeyboardInterrupt as exc:
+        raise CommandError("client wait interrupted; server task was not cancelled", error_kind="job_interrupted",
+                           job_id=job_id, details={"next_command": f"job wait {job_id}", "server_task_cancelled": False}) from exc
+
+
+def download_job_report(
+    client: Codex2APIClient, args: argparse.Namespace, job: dict[str, Any], out: Path | None, out_dir: Path | None, *,
+    options: ImageOptions | None = None,
+) -> dict[str, Any]:
+    snapshot = job_snapshot(job)
+    job_id, status = snapshot["job_id"], snapshot["status"]
+    if status not in TERMINAL_JOB_STATUSES:
+        raise CommandError("job is still active; wait for a terminal state before downloading", error_kind="job_active",
+                           job_id=job_id, details={**snapshot, "next_command": f"job wait {job_id}"})
+    terminal_error = job_failure(client, job) if status in FAILED_JOB_STATUSES else None
+    if terminal_error is not None and not snapshot["asset_count"]:
+        raise terminal_error
+    params = job_params(job) if options is None else {}
+    model = options.model if options is not None else params.get("model", "unknown")
+    size = options.size if options is not None else params.get("size", "auto")
+    strict = options.strict_size if options is not None else params.get("strict_size")
+    if not isinstance(model, str) or not isinstance(size, str) or (strict is not None and type(strict) is not bool):
+        raise CommandError("invalid job model, size or strict_size metadata", error_kind="invalid_response", job_id=job_id)
+    if strict is not False:
+        parse_size(size)
+    requested = options.n if options is not None else snapshot["requested_outputs"]
+    try:
+        saved = save_job_assets(client, job, out, out_dir, args.download_timeout, request_timeout=args.timeout)
+    except CommandError as error:
+        error.job_id = job_id
+        if terminal_error is not None:
+            error.details["job_error"] = terminal_error.as_dict()
+        raise
+    warnings = [client.redact(str(job.get("warning") or ""))]
+    if snapshot["completed_outputs"] != len(saved):
+        warnings.append(f"server reports {snapshot['completed_outputs']} completed outputs, saved {len(saved)}")
+    if snapshot["requested_outputs"] != requested:
+        warnings.append(f"server reports {snapshot['requested_outputs']} requested outputs, client requested {requested}")
+    report = saved_report(saved, model=client.redact(model), requested_n=requested, size=size,
+                          strict_size=strict is not False, warning="; ".join(w for w in warnings if w))
+    report.update({**snapshot, "mode": "job"})
+    if terminal_error is not None:
+        report.update({"ok": False, "error": terminal_error.as_dict()})
+    return report
+
+
 def run_prepared(client: Codex2APIClient, args: argparse.Namespace, prepared: PreparedRequest) -> dict[str, Any]:
     deadline = time.monotonic() + args.timeout
     response, attempts = client.request_with_retry("POST", ROUTES[prepared.mode], prepared.payload, timeout=args.timeout,
@@ -158,17 +222,8 @@ def run_prepared(client: Codex2APIClient, args: argparse.Namespace, prepared: Pr
     try:
         if prepared.mode == "job":
             job_id = response_job_id(response)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise CommandError("job submitted but wait budget exhausted", job_id=job_id)
-            job = wait_job(client, job_id, remaining, args.poll_interval, auto_retry=prepared.auto_retry, max_attempts=args.max_attempts)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise CommandError("job completed but download budget exhausted; resume job wait", job_id=job_id)
-            saved = save_job_assets(client, job, prepared.out, prepared.out_dir, remaining)
-            report = saved_report(saved, model=prepared.options.model, requested_n=prepared.options.n, size=prepared.options.size,
-                                  strict_size=prepared.options.strict_size is not False, warning=client.redact(str(job.get("warning") or "")))
-            report["job_id"] = job_id
+            job = wait_for_job(client, args, job_id, auto_retry=prepared.auto_retry)
+            report = download_job_report(client, args, job, prepared.out, prepared.out_dir, options=prepared.options)
         else:
             assert prepared.out is not None
             remaining = deadline - time.monotonic()
@@ -220,7 +275,14 @@ def cmd_job_submit(args: argparse.Namespace) -> int:
     client = client_from_args(args)
     response, attempts = client.request_with_retry("POST", "/images/jobs", prepared.payload, timeout=args.timeout,
                                                   auto_retry=prepared.auto_retry, max_attempts=args.max_attempts)
-    print_json({"job_id": response_job_id(response), "status": response_job(response).get("status"), "attempts": attempts})
+    job_id = response_job_id(response)
+    try:
+        snapshot = job_snapshot(response_job(response))
+    except CommandError as error:
+        error.job_id = job_id
+        error.details["next_command"] = f"job status {job_id}"
+        raise
+    print_json({**snapshot, "attempts": attempts})
     return 0
 
 
@@ -228,30 +290,41 @@ def cmd_job_wait(args: argparse.Namespace) -> int:
     out = resolve_output(Path(args.out)) if args.out else None
     out_dir = Path(args.out_dir) if args.out_dir else None
     client = client_from_args(args)
-    deadline = time.monotonic() + args.timeout
-    job = wait_job(client, args.job_id, args.timeout, args.poll_interval, auto_retry=args.auto_retry, max_attempts=args.max_attempts)
+    job = wait_for_job(client, args, args.job_id, auto_retry=args.auto_retry)
     try:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise CommandError("job completed but download budget exhausted; resume job wait")
-        saved = save_job_assets(client, job, out, out_dir, remaining)
-        params: dict[str, Any] = {}
-        raw_params = job.get("params_json")
-        if isinstance(raw_params, str):
-            try:
-                parsed = json.loads(raw_params)
-                if isinstance(parsed, dict):
-                    params = parsed
-            except json.JSONDecodeError:
-                pass
-        requested = params.get("n", len(saved))
-        if type(requested) is not int or requested < 1:
-            requested = len(saved)
-        size = params.get("size") or "auto"
-        report = saved_report(saved, model=str(params.get("model") or "unknown"), requested_n=requested,
-                              size=size, strict_size=params.get("strict_size") is not False,
-                              warning=client.redact(str(job.get("warning") or "")))
-        report.update({"job_id": args.job_id, "mode": "job"})
+        report = download_job_report(client, args, job, out, out_dir)
+        print_json(report)
+        return 0 if report["ok"] else 1
+    except CommandError as error:
+        error.job_id = args.job_id
+        raise
+
+
+def cmd_job_status(args: argparse.Namespace) -> int:
+    client = client_from_args(args)
+    job = get_job(client, args.job_id, args.timeout, auto_retry=args.auto_retry, max_attempts=args.max_attempts)
+    snapshot = job_snapshot(job)
+    warnings = [client.redact(str(job.get("warning") or ""))]
+    if snapshot["status"] == "succeeded":
+        if snapshot["completed_outputs"] != snapshot["requested_outputs"]:
+            warnings.append(f"requested {snapshot['requested_outputs']} outputs, completed {snapshot['completed_outputs']}")
+        if snapshot["asset_count"] != snapshot["completed_outputs"]:
+            warnings.append(f"server reports {snapshot['completed_outputs']} completed outputs, lists {snapshot['asset_count']} assets")
+    warning = "; ".join(w for w in warnings if w)
+    report = {"ok": not warning, **snapshot, "warning": warning}
+    if snapshot["status"] in FAILED_JOB_STATUSES:
+        report.update({"ok": False, "error": job_failure(client, job).as_dict()})
+    print_json(report)
+    return 0 if report["ok"] else 1
+
+
+def cmd_job_download(args: argparse.Namespace) -> int:
+    out = resolve_output(Path(args.out)) if args.out else None
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    client = client_from_args(args)
+    job = get_job(client, args.job_id, args.timeout, auto_retry=args.auto_retry, max_attempts=args.max_attempts)
+    try:
+        report = download_job_report(client, args, job, out, out_dir)
         print_json(report)
         return 0 if report["ok"] else 1
     except CommandError as error:
@@ -333,9 +406,26 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url")
     parser.add_argument("--api-key", help="Prefer CODEX2API_API_KEY in the env file; never place keys in shell history")
     parser.add_argument("--env-file")
-    parser.add_argument("--timeout", type=float, default=900)
+    parser.add_argument("--timeout", type=float, default=900,
+                        help="HTTP/retry budget in seconds; not the total job wait budget (default: 900)")
     parser.add_argument("--auto-retry", action="store_true")
     parser.add_argument("--max-attempts", type=int, default=3)
+
+
+def add_download_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--download-timeout", type=float, default=DEFAULT_DOWNLOAD_TIMEOUT,
+                        help="Separate total job asset download budget in seconds (default: 900)")
+
+
+def add_wait_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--poll-interval", type=float, default=2)
+    parser.add_argument("--queue-timeout", type=float, default=DEFAULT_QUEUE_TIMEOUT,
+                        help="Client queue wait budget in seconds (default: 900)")
+    parser.add_argument("--execution-timeout", type=float,
+                        help="Execution wait budget from first observed running state (default: 900 x requested outputs)")
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True,
+                        help="Emit status/count changes as JSON lines to stderr; stdout remains the final result")
+    add_download_options(parser)
 
 
 def add_image_options(parser: argparse.ArgumentParser) -> None:
@@ -355,7 +445,7 @@ def add_output(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="API-key-only codex2api image CLI (v2.9.5 contract)")
+    parser = argparse.ArgumentParser(description="API-key-only codex2api image CLI (v2.9.5 + local queued jobs)")
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
     models = sub.add_parser("models")
@@ -378,7 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch.add_argument("--input", required=True)
     batch.add_argument("--out-dir", required=True)
     batch.add_argument("--concurrency", type=int, default=2)
-    batch.add_argument("--poll-interval", type=float, default=2)
+    add_wait_options(batch)
     batch.add_argument("--dry-run", action="store_true")
     batch.set_defaults(func=cmd_batch)
     jobs = sub.add_parser("job").add_subparsers(dest="job_command", required=True)
@@ -392,14 +482,24 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--dry-run", action="store_true")
         if name == "run":
             add_output(command)
-            command.add_argument("--poll-interval", type=float, default=2)
+            add_wait_options(command)
         command.set_defaults(func=cmd_job_submit if name == "submit" else cmd_image)
     wait = jobs.add_parser("wait")
     add_common(wait)
     wait.add_argument("job_id", type=int)
     add_output(wait)
-    wait.add_argument("--poll-interval", type=float, default=2)
+    add_wait_options(wait)
     wait.set_defaults(func=cmd_job_wait)
+    status = jobs.add_parser("status", help="Read job metadata once, without downloading or submitting")
+    add_common(status)
+    status.add_argument("job_id", type=int)
+    status.set_defaults(func=cmd_job_status)
+    download = jobs.add_parser("download", help="Download existing assets from a terminal job; never submit or wait")
+    add_common(download)
+    download.add_argument("job_id", type=int)
+    add_output(download)
+    add_download_options(download)
+    download.set_defaults(func=cmd_job_download)
     save = sub.add_parser("asset").add_subparsers(dest="asset_command", required=True).add_parser("save")
     add_common(save)
     save.add_argument("--url", required=True)
@@ -414,10 +514,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        timeout = getattr(args, "timeout", 1)
-        interval = getattr(args, "poll_interval", 1)
-        if not math.isfinite(timeout) or timeout <= 0 or not math.isfinite(interval) or interval <= 0:
-            raise CommandError("timeout and poll interval must be positive and finite")
+        for name in ("timeout", "poll_interval", "queue_timeout", "execution_timeout", "download_timeout"):
+            value = getattr(args, name, None)
+            if value is not None:
+                validate_timeout(value, name.replace("_", " "))
+        if hasattr(args, "job_id"):
+            validate_job_id(args.job_id)
         if getattr(args, "max_attempts", 1) < 1:
             raise CommandError("max_attempts must be at least 1")
         return args.func(args)

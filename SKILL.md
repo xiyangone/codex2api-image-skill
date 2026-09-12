@@ -5,7 +5,7 @@ description: Generate, edit, batch, download and verify raster images through th
 
 # Codex2API Image
 
-通过本机 codex2api 的 API Key 接口处理图片。CLI 版本 `0.3.0`，接口核对基线为 [codex2api v2.9.5](https://github.com/james-6-23/codex2api/releases/tag/v2.9.5)。运行中的 exe、模型目录和账号权限仍需分别核对，不把源码版本当作服务可用性证明。
+通过本机 codex2api 的 API Key 接口处理图片。CLI 版本 `0.4.0`，接口基线为 [codex2api v2.9.5](https://github.com/james-6-23/codex2api/releases/tag/v2.9.5)，并已核对 2026-09-11 本地图片任务队列扩展。运行中的 exe、模型目录和账号权限仍需分别核对，不把源码版本当作服务可用性证明。
 
 ## 必守边界
 
@@ -23,10 +23,12 @@ description: Generate, edit, batch, download and verify raster images through th
 | 精确画布，例如 1920×1080 | `job run --size 1920x1080` | 保留目标尺寸，服务端处理上游尺寸适配；不在客户端向下取整 |
 | 一个任务生成 1–4 张 | `job run --n N` | 同步接口不支持 `n>1`，不能静默忽略 |
 | 多个独立任务 | `batch` | 先整批预检，再执行；默认并发 2，账号较少时使用 1–2 |
-| 已提交任务的继续查询 / 下载 | `job wait ID` | 使用创建时的同一 API Key，不重新提交任务 |
+| 已提交任务的一次状态查询 | `job status ID` | 只读状态和进度，不等待、不下载、不输出原始参数 |
+| 继续等待已提交任务 | `job wait ID` | 使用创建时的同一 API Key；成功后下载，不重新提交 |
+| 取回已结束任务的已有图片 | `job download ID` | 不等待、不生成；失败或取消任务的图片仅作为恢复结果 |
 | 签名资源下载 / 本地检查 | `asset save` / `info` | 不向资源 URL 发送 API Key；完整解码校验后报告实际尺寸 |
 
-首次使用或运行端更新后，检查 `/health` 与 `models`。模型出现在目录中只证明目录可读，不证明账号能出图。没有账号时仅做 dry-run 和离线测试，不自动发起生图探测。
+首次使用或运行端更新后，检查 `/health` 与 `models`。目录按当前 API Key 可见的账号、分组和模型策略筛选；没有图片模型时先报告该范围内不可见，不能据此判定源码缺少适配。目录可读或列出模型都不证明账号能出图。没有账号时仅做 dry-run 和离线测试，不自动发起生图探测。
 
 ## 模型与尺寸
 
@@ -49,9 +51,11 @@ uv run --locked codex2api-image info 'G:\images\cat-new.png'
 ## 失败与验收
 
 - `--auto-retry` 只对可恢复读取错误，或带有效 `Retry-After` 的 429/503，执行有限退避；默认最多 3 次。401/403、明确拒绝和结果未知的 POST 超时均不自动重发。
-- 已取得 job ID 后只轮询原任务。等待或下载失败时报告 job ID，续查原任务；不要通过再次生成来恢复下载。
+- Job 的请求、排队、执行和下载预算独立。默认排队 900 秒、执行每张 900 秒、整组下载 900 秒；执行从首次观察到 running 开始计时。`--queue-timeout`、`--execution-timeout`、`--download-timeout` 可调整，超时或中断等待不取消服务端任务。
+- 等待时仅在状态或数量变化后向 stderr 输出 JSON 行进度，stdout 保留最终 JSON；`--no-progress` 可关闭进度。`job status` 返回 0 只代表本次查询正常，必须结合 status/terminal 判断是否已完成。
+- 已取得 job ID 后只处理原任务。等待失败用 `job status/wait` 续查；下载失败或失败/取消任务已有图片时用 `job download`，不重新生成。公开 `/v1` 接口尚无取消路由，不借用后台管理接口。
 - 保存后输出 `saved[]`、每张图的格式 / 宽高 / 字节数、请求模型和数量；`info` 使用相同完整解码检查。随后目视验收内容。
-- 部分成功、服务端警告或 job 精确尺寸不符均保留已保存文件并返回非零退出码；不能报告“全部完成”。
+- 部分成功、服务端警告或 job 精确尺寸不符均保留已保存文件并返回非零退出码。失败/取消任务即使已恢复图片也保持 `ok=false` 和原失败状态，不能报告“全部完成”。
 - 错误报告保留路由、HTTP 状态、错误类型、脱敏响应体、重试记录和已保存路径。不得把账号、限流、文本驱动问题当成提示词问题。
 
 ## 按需参考
@@ -59,4 +63,4 @@ uv run --locked codex2api-image info 'G:\images\cat-new.png'
 - [commands.md](references/commands.md)：CLI、批量 JSON、依赖维护和退出码。
 - [api-map.md](references/api-map.md)：同步 / 异步参数、模型与资源职责。
 - [prompting.md](references/prompting.md)：原意保留和参考图角色。
-- [troubleshooting.md](references/troubleshooting.md)：v2.9.5 限流、错误分类、续查与验证边界。
+- [troubleshooting.md](references/troubleshooting.md)：排队、限流、错误分类、结果恢复与验证边界。

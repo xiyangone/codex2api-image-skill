@@ -2,12 +2,14 @@
 
 接口核对基线：[codex2api v2.9.5](https://github.com/james-6-23/codex2api/releases/tag/v2.9.5)，tag commit `d680021707b5062db20c0009bde16ca664ad4848`。本地可能包含独立修改，运行版本、目录、账号权限需实时区分。
 
+任务生命周期另按 2026-09-11 的本地图片队列扩展核对；这是 v2.9.5 上的本地功能，不是新的上游发布版本。
+
 ## 路由职责
 
 | 路由 | 认证 | 职责 |
 |---|---|---|
 | GET /health | 服务健康检查 | 存活和汇总状态，不证明模型权限 |
-| GET /v1/models | API Key | 模型目录；不证明真实出图可用 |
+| GET /v1/models | API Key | 当前 key 可见的模型目录；不是全部内置模型清单，不证明真实出图可用 |
 | POST /v1/images/generations | API Key | 同步文生图 |
 | POST /v1/images/edits | API Key | 同步编辑；JSON `images[].image_url` |
 | POST /v1/images/jobs | API Key | 异步生成 / 编辑；返回 202 与数值 `job.id` |
@@ -15,6 +17,18 @@
 | /p/img/... | 签名 URL | 下载资源，不附带 API Key |
 
 Batch 是 CLI 的并发编排，不是独立的服务端 Batch API。
+
+`job status/wait/download` 都只读取 `GET /v1/images/jobs/:id`，download 随后读取现有资源。公开 `/v1` 尚无 job list/cancel 路由；取消仅在管理端和图片门户提供，CLI 不借用这些接口或升级认证权限。
+
+## 本地队列与状态契约
+
+- 接收时校验配额，取得账号和 key 的并发容量后才开始执行；queued 不占用执行并发位。核对时在途任务总上限 128、每个 key 32，排队上限 24 小时，执行超时按每张 12 分钟计算。这些是该本地服务端的实现值，不写入客户端的固定权限或永久默认。
+- 状态为 queued → running → succeeded/failed/cancelled。重启只恢复未执行的受管队列项；已运行或来源不明的任务不自动重放。客户端同样不因轮询、下载或服务重启而再次 POST。
+- GET 响应包含 `job.id`、`status`、`requested_outputs`、`completed_outputs` 和 `assets`。客户端校验查询 ID 一致性，使用进度字段；缺少 requested_outputs 时从 params_json.n 读取请求数，不拿实际保存数量猜测请求数量。
+- succeeded 也可能有 warning 或数量不足；failed/cancelled 也可能保留资产。状态、数量、实际文件分别报告，恢复资产不改变任务终态。
+- 客户端采用独立且有限的请求、排队、执行、下载预算，具体参数见 commands.md；计时/等待中断不发送取消请求。
+
+模型目录由当前 key 的账号范围、分组、通道与模型允许/拒绝策略共同筛选。目录缺少图片模型不能证明源码不支持图片；需报告可见范围限制，不能自动放开权限或用真实生成请求探测账号。
 
 ## 参数映射
 
@@ -38,7 +52,7 @@ GPT Image 2 系列的上游尺寸总像素不超过 8,294,400，长短边比例�
 
 ## 错误与任务结果
 
-- v2.9.5 的瞬时限流、调度队列满等可能返回 429/503 和 Retry-After。HTTP 状态、错误 code/type 与响应头共同决定能否有限退避。
+- v2.9.5 的瞬时限流、调度队列满等可能返回 429/503；Retry-After 并非总会出现。HTTP 状态、错误 code/type 与实际响应头共同决定能否有限退避；已受理的 queued 任务只继续读取原 ID。
 - 401/403、明确内容拒绝和 POST 的未知结果不能自动重发。服务端已进行调度 / 重试，客户端不再堆叠提示词或降档重试链。
 - Job 保存 `error_kind`、`status_code`、`upstream_body` 和成功警告 `warning`。成功状态仍可能只完成部分图片。
 - 默认查询不加 `include_cache=1`；避免下载未使用的 Base64 缓存。已返回的 cache_b64_json 可用于保存，否则下载 proxy_url/url。
